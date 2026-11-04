@@ -2,7 +2,7 @@
 
 # create CA 
 openssl req -x509 \
-            -sha256 -days 356 \
+            -sha256 -days 3651 \
             -nodes \
             -newkey rsa:2048 \
             -subj "/CN=MyOwnCA/C=US/L=San Fransisco" \
@@ -52,7 +52,7 @@ openssl x509 -req \
     -in server.csr \
     -CA rootCA.crt -CAkey rootCA.key \
     -out server.crt \
-    -days 365 \
+    -days 3650 \
     -sha256 -extfile cert.conf
 
 # create pkcs12
