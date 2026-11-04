@@ -44,7 +44,7 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          toolchain: 1.71
+          toolchain: 1.79
           default: true
       
       - name: Install OpenSSL
