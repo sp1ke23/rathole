@@ -68,7 +68,7 @@ jobs:
       # Cross build
       - name: Install cross
         if: matrix.cross
-        run: cargo install --version 0.2.5 cross
+        run: cargo install --locked --version 0.2.5 cross
       - name: Run tests
         if: matrix.cross
         run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
