@@ -1,6 +1,11 @@
 use anyhow::Result;
 use vergen::{vergen, Config, SemverKind};
 
+// The pinned libgit2-sys version does not declare this Windows link dependency.
+#[cfg(windows)]
+#[link(name = "advapi32")]
+extern "system" {}
+
 fn main() -> Result<()> {
     let mut config = Config::default();
     // Change the SEMVER output to the lightweight variant
