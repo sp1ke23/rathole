@@ -14,6 +14,8 @@ jobs:
   release:
     name: Cross build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
+    permissions:
+      contents: write
     strategy:
       matrix:
         include:
