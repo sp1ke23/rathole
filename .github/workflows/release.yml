@@ -71,7 +71,9 @@ jobs:
         run: cargo install --locked --version 0.2.5 cross
       - name: Run tests
         if: matrix.cross
-        run: cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
+        run: >-
+          cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
+          --config 'env.RATHOLE_TEST_ALLOW_QEMU_DEVICE_EINVAL="1"'
       - name: Build release
         if: matrix.cross
         run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
