@@ -1,10 +1,16 @@
+#[cfg(feature = "client")]
+use anyhow::Context;
 use anyhow::{anyhow, Result};
 use async_http_proxy::{http_connect_tokio, http_connect_tokio_with_basic_auth};
 use backoff::{backoff::Backoff, Notify};
+#[cfg(feature = "client")]
+use socket2::{Domain, Socket, Type};
 use socket2::{SockRef, TcpKeepalive};
 use std::{future::Future, net::SocketAddr, time::Duration};
+#[cfg(feature = "client")]
+use tokio::net::{TcpSocket, UdpSocket};
 use tokio::{
-    net::{lookup_host, TcpStream, ToSocketAddrs, UdpSocket},
+    net::{lookup_host, TcpStream, ToSocketAddrs},
     sync::broadcast,
 };
 use tracing::trace;
@@ -54,16 +60,66 @@ pub fn host_port_pair(s: &str) -> Result<(&str, u16)> {
     Ok((&s[..semi], s[semi + 1..].parse()?))
 }
 
-/// Create a UDP socket and connect to `addr`
-pub async fn udp_connect<A: ToSocketAddrs>(addr: A) -> Result<UdpSocket> {
+#[cfg(feature = "client")]
+fn new_bound_socket(addr: SocketAddr, kind: Type, interface: &str) -> Result<Socket> {
+    let socket = Socket::new(Domain::for_address(addr), kind, None)?;
+
+    #[cfg(target_os = "linux")]
+    let bind_result = socket.bind_device(Some(interface.as_bytes()));
+    #[cfg(not(target_os = "linux"))]
+    let bind_result: std::io::Result<()> = Err(std::io::Error::new(
+        std::io::ErrorKind::Unsupported,
+        "local_addr_if is only supported on Linux",
+    ));
+    bind_result.with_context(|| format!("Failed to bind socket to interface {:?}", interface))?;
+
+    socket.set_nonblocking(true)?;
+    Ok(socket)
+}
+
+#[cfg(feature = "client")]
+pub async fn tcp_connect_local<A: ToSocketAddrs>(
+    addr: A,
+    interface: Option<&str>,
+) -> Result<TcpStream> {
+    let Some(interface) = interface else {
+        return Ok(TcpStream::connect(addr).await?);
+    };
+
+    let mut last_error = None;
+    for addr in lookup_host(addr).await? {
+        let result = match new_bound_socket(addr, Type::STREAM, interface) {
+            Ok(socket) => TcpSocket::from_std_stream(socket.into())
+                .connect(addr)
+                .await
+                .map_err(Into::into),
+            Err(error) => Err(error),
+        };
+        match result {
+            Ok(stream) => return Ok(stream),
+            Err(error) => last_error = Some(error),
+        }
+    }
+    Err(last_error.unwrap_or_else(|| anyhow!("Failed to lookup the host")))
+}
+
+/// Create a UDP socket and connect to `addr`.
+#[cfg(feature = "client")]
+pub async fn udp_connect<A: ToSocketAddrs>(addr: A, interface: Option<&str>) -> Result<UdpSocket> {
     let addr = to_socket_addr(addr).await?;
 
     let bind_addr = match addr {
-        SocketAddr::V4(_) => "0.0.0.0:0",
-        SocketAddr::V6(_) => ":::0",
+        SocketAddr::V4(_) => SocketAddr::from(([0; 4], 0)),
+        SocketAddr::V6(_) => SocketAddr::from(([0; 8], 0)),
     };
 
-    let s = UdpSocket::bind(bind_addr).await?;
+    let s = if let Some(interface) = interface {
+        let socket = new_bound_socket(addr, Type::DGRAM, interface)?;
+        socket.bind(&bind_addr.into())?;
+        UdpSocket::from_std(socket.into())?
+    } else {
+        UdpSocket::bind(bind_addr).await?
+    };
     s.connect(addr).await?;
     Ok(s)
 }
@@ -142,5 +198,84 @@ where
         _ = deadline.recv() => {
             Err(anyhow!("shutdown"))
         }
+    }
+}
+
+#[cfg(all(test, feature = "client", target_os = "linux"))]
+mod tests {
+    use super::*;
+    use tokio::{
+        io::{AsyncReadExt, AsyncWriteExt},
+        net::TcpListener,
+        time::timeout,
+    };
+
+    const MISSING_INTERFACE: &str = "noif-rathole0";
+
+    fn loopback_addrs() -> Vec<&'static str> {
+        let mut addresses = vec!["127.0.0.1:0"];
+        match std::net::UdpSocket::bind("[::1]:0") {
+            Ok(_) => addresses.push("[::1]:0"),
+            Err(error) => eprintln!("Skipping IPv6 loopback tests: {error}"),
+        }
+        addresses
+    }
+
+    #[tokio::test]
+    async fn tcp_local_addr_if() -> Result<()> {
+        for loopback in loopback_addrs() {
+            let listener = TcpListener::bind(loopback).await?;
+            let addr = listener.local_addr()?;
+            let unused = TcpSocket::new_v4()?;
+            unused.bind("127.0.0.1:0".parse()?)?;
+            let addresses = [unused.local_addr()?, addr];
+            let mut client = tcp_connect_local(&addresses[..], Some("lo")).await?;
+            assert_eq!(
+                SockRef::from(&client).device()?.as_deref(),
+                Some(&b"lo"[..])
+            );
+
+            let (mut backend, _) = listener.accept().await?;
+            client.write_all(b"ping").await?;
+            let mut buf = [0; 4];
+            timeout(Duration::from_secs(5), backend.read_exact(&mut buf)).await??;
+            assert_eq!(&buf, b"ping");
+
+            let error = tcp_connect_local(addr, Some(MISSING_INTERFACE))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(MISSING_INTERFACE));
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+        }
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn udp_local_addr_if() -> Result<()> {
+        for loopback in loopback_addrs() {
+            let backend = UdpSocket::bind(loopback).await?;
+            let addr = backend.local_addr()?;
+            let client = udp_connect(addr, Some("lo")).await?;
+            assert_eq!(
+                SockRef::from(&client).device()?.as_deref(),
+                Some(&b"lo"[..])
+            );
+
+            client.send(b"ping").await?;
+            let mut buf = [0; 4];
+            let (len, from) =
+                timeout(Duration::from_secs(5), backend.recv_from(&mut buf)).await??;
+            assert_eq!(&buf[..len], b"ping");
+            backend.send_to(b"pong", from).await?;
+            let len = timeout(Duration::from_secs(5), client.recv(&mut buf)).await??;
+            assert_eq!(&buf[..len], b"pong");
+
+            let error = udp_connect(addr, Some(MISSING_INTERFACE))
+                .await
+                .unwrap_err();
+            assert!(error.to_string().contains(MISSING_INTERFACE));
+            assert!(error.downcast_ref::<std::io::Error>().is_some());
+        }
+        Ok(())
     }
 }

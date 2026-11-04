@@ -266,6 +266,36 @@ mod test {
 
     use super::*;
 
+    #[test]
+    fn test_reload_local_addr_if() {
+        let mut service = ClientServiceConfig::with_name("backend");
+        service.local_addr_if = Some("lo".into());
+        let mut old = Config {
+            server: None,
+            client: Some(ClientConfig {
+                services: HashMap::from([(service.name.clone(), service.clone())]),
+                ..Default::default()
+            }),
+        };
+
+        for interface in [Some("eth0".into()), None] {
+            service.local_addr_if = interface;
+            let mut new = old.clone();
+            new.client
+                .as_mut()
+                .unwrap()
+                .services
+                .insert(service.name.clone(), service.clone());
+            assert_eq!(
+                calculate_events(&old, &new),
+                Some(vec![ConfigChange::ClientChange(ClientServiceChange::Add(
+                    service.clone()
+                ))])
+            );
+            old = new;
+        }
+    }
+
     // macro to create map or set literal
     macro_rules! collection {
         // map-like

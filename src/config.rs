@@ -53,8 +53,7 @@ pub enum TransportType {
     Websocket,
 }
 
-/// Per service config
-/// All Option are optional in configuration but must be Some value in runtime
+/// Per-client-service configuration
 #[derive(Debug, Serialize, Deserialize, Clone, PartialEq, Eq, Default)]
 #[serde(deny_unknown_fields)]
 pub struct ClientServiceConfig {
@@ -63,6 +62,7 @@ pub struct ClientServiceConfig {
     #[serde(skip)]
     pub name: String,
     pub local_addr: String,
+    pub local_addr_if: Option<String>,
     pub token: Option<MaskedString>,
     pub nodelay: Option<bool>,
     pub retry_interval: Option<u64>,
@@ -273,6 +273,18 @@ impl Config {
         // Validate services
         for (name, s) in &mut client.services {
             s.name = name.clone();
+            if let Some(interface) = &s.local_addr_if {
+                if !cfg!(target_os = "linux") {
+                    bail!(
+                        "local_addr_if for service {} is only supported on Linux",
+                        name
+                    );
+                }
+                // Linux's IFNAMSIZ includes the terminating NUL.
+                if interface.is_empty() || interface.len() > 15 || interface.contains('\0') {
+                    bail!("Invalid local_addr_if for service {}: expected a network interface name of 1 to 15 bytes without NUL", name);
+                }
+            }
             if s.token.is_none() {
                 s.token = client.default_token.clone();
                 if s.token.is_none() {
@@ -387,6 +399,43 @@ mod tests {
         for p in paths {
             let s = fs::read_to_string(p)?;
             assert!(Config::from_str(&s).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_local_addr_if_config() -> Result<()> {
+        let base = r#"
+[client]
+remote_addr = "127.0.0.1:2333"
+default_token = "test"
+
+[client.services.backend]
+local_addr = "127.0.0.1:8080"
+"#;
+        let old = Config::from_str(base)?;
+        assert_eq!(old.client.unwrap().services["backend"].local_addr_if, None);
+
+        let bound = Config::from_str(&format!("{base}local_addr_if = \"lo\"\n"));
+        if cfg!(target_os = "linux") {
+            assert_eq!(
+                bound?.client.unwrap().services["backend"]
+                    .local_addr_if
+                    .as_deref(),
+                Some("lo")
+            );
+            for name in ["", r"lo\u0000bad", "abcdefghijklmnop"] {
+                let error =
+                    Config::from_str(&format!("{base}local_addr_if = \"{name}\"\n")).unwrap_err();
+                assert!(error
+                    .to_string()
+                    .contains("Invalid local_addr_if for service backend"));
+            }
+        } else {
+            assert!(bound
+                .unwrap_err()
+                .to_string()
+                .contains("only supported on Linux"));
         }
         Ok(())
     }

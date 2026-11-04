@@ -133,6 +133,7 @@ tls = true # If `true` then it will use settings in `client.transport.tls`
 type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
+# local_addr_if = "lo" # 可选。指定客户端访问 local_addr 时使用的 Linux 网卡，适用于 TCP 和 UDP
 nodelay = true # Optional. Determine whether to enable TCP_NODELAY for data transmission, if applicable, to improve the latency but decrease the bandwidth. Default: true
 retry_interval = 1 # Optional. The interval between retry to connect to the server. Default: inherits the global config
 

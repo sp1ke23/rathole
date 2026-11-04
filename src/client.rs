@@ -1,6 +1,6 @@
 use crate::config::{ClientConfig, ClientServiceConfig, Config, ServiceType, TransportType};
 use crate::config_watcher::{ClientServiceChange, ConfigChange};
-use crate::helper::udp_connect;
+use crate::helper::{tcp_connect_local, udp_connect};
 use crate::protocol::Hello::{self, *};
 use crate::protocol::{
     self, read_ack, read_control_cmd, read_data_cmd, read_hello, Ack, Auth, ControlChannelCmd,
@@ -15,7 +15,7 @@ use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::Arc;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
-use tokio::net::{TcpStream, UdpSocket};
+use tokio::net::UdpSocket;
 use tokio::sync::{broadcast, mpsc, oneshot, RwLock};
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, trace, warn, Instrument, Span};
@@ -220,29 +220,37 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
             if args.service.service_type != ServiceType::Tcp {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_tcp::<T>(conn, &args.service).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if args.service.service_type != ServiceType::Udp {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
-            run_data_channel_for_udp::<T>(conn, &args.service.local_addr).await?;
+            run_data_channel_for_udp::<T>(conn, &args.service).await?;
         }
     }
     Ok(())
 }
 
 // Simply copying back and forth for TCP
-#[instrument(skip(conn))]
+#[instrument(skip_all, fields(local_addr = %service.local_addr))]
 async fn run_data_channel_for_tcp<T: Transport>(
     mut conn: T::Stream,
-    local_addr: &str,
+    service: &ClientServiceConfig,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
 
-    let mut local = TcpStream::connect(local_addr)
-        .await
-        .with_context(|| format!("Failed to connect to {}", local_addr))?;
+    let mut local = tcp_connect_local(
+        service.local_addr.as_str(),
+        service.local_addr_if.as_deref(),
+    )
+    .await
+    .with_context(|| {
+        format!(
+            "Failed to connect to {} for service {}",
+            service.local_addr, service.name
+        )
+    })?;
     let _ = copy_bidirectional(&mut conn, &mut local).await;
     Ok(())
 }
@@ -253,8 +261,11 @@ async fn run_data_channel_for_tcp<T: Transport>(
 // to the socket will work fine for the map's value.
 type UdpPortMap = Arc<RwLock<HashMap<SocketAddr, mpsc::Sender<Bytes>>>>;
 
-#[instrument(skip(conn))]
-async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &str) -> Result<()> {
+#[instrument(skip_all, fields(local_addr = %service.local_addr))]
+async fn run_data_channel_for_udp<T: Transport>(
+    conn: T::Stream,
+    service: &ClientServiceConfig,
+) -> Result<()> {
     debug!("New data channel starts forwarding");
 
     let port_map: UdpPortMap = Arc::new(RwLock::new(HashMap::new()));
@@ -304,7 +315,12 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
             // grabbing the writer lock
             let mut m = port_map.write().await;
 
-            match udp_connect(local_addr).await {
+            match udp_connect(
+                service.local_addr.as_str(),
+                service.local_addr_if.as_deref(),
+            )
+            .await
+            {
                 Ok(s) => {
                     let (inbound_tx, inbound_rx) = mpsc::channel(UDP_SENDQ_SIZE);
                     m.insert(packet.from, inbound_tx);
@@ -317,7 +333,10 @@ async fn run_data_channel_for_udp<T: Transport>(conn: T::Stream, local_addr: &st
                     ));
                 }
                 Err(e) => {
-                    error!("{:#}", e);
+                    error!(
+                        "Failed to connect to {} for service {}: {:#}",
+                        service.local_addr, service.name, e
+                    );
                 }
             }
         }
