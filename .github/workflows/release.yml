@@ -25,45 +25,13 @@ jobs:
             target: aarch64-unknown-linux-musl
             exe: rathole
             cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabi
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: arm-unknown-linux-musleabihf
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: armv7-unknown-linux-musleabihf
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-gnu
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips-unknown-linux-musl
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-gnu
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mipsel-unknown-linux-musl
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips64-unknown-linux-gnuabi64
-            exe: rathole
-            cross: true
-          - os: ubuntu-latest
-            target: mips64el-unknown-linux-gnuabi64
-            exe: rathole
-            cross: true
 
-          - os: macos-latest
+          - os: macos-15-intel
             target: x86_64-apple-darwin
+            exe: rathole
+            cross: false
+          - os: macos-15
+            target: aarch64-apple-darwin
             exe: rathole
             cross: false
 
@@ -76,7 +44,6 @@ jobs:
       - uses: actions-rs/toolchain@v1
         with:
           profile: minimal
-          # Since rust 1.72, some platforms are tier 3
           toolchain: 1.71
           default: true
       
@@ -84,7 +51,7 @@ jobs:
         if: matrix.os == 'ubuntu-latest'
         run: sudo apt-get install pkg-config libssl-dev
       - name: Install OpenSSL
-        if: matrix.os == 'macos-latest'
+        if: startsWith(matrix.os, 'macos-')
         run: brew install openssl@3
       
       # Native build
@@ -112,8 +79,7 @@ jobs:
       - name: Run UPX
         # Upx may not support some platforms. Ignore the errors
         continue-on-error: true
-        # Disable upx for mips. See https://github.com/upx/upx/issues/387
-        if: matrix.os == 'ubuntu-latest' && !contains(matrix.target, 'mips')
+        if: matrix.os == 'ubuntu-latest'
         uses: crazy-max/ghaction-upx@v1
         with:
           version: v4.0.2
