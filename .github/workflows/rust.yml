@@ -4,7 +4,7 @@ on:
   pull_request:
     branches: ["*"]
   push:
-    branches: ["main", "dev"]
+    branches: ["main", "dev", "v0.5.0-patch"]
 
 concurrency:
   # Documentation suggests ${{ github.head_ref }}, but that's only available on pull_request/pull_request_target triggers, so using ${{ github.ref }}.
@@ -64,7 +64,7 @@ jobs:
         run: cargo build
       - name: Run tests
         run: cargo test --verbose
-      - uses: actions/upload-artifact@v2
+      - uses: actions/upload-artifact@v7
         with:
           name: rathole-${{ matrix.target }}
           path: target/debug/${{ matrix.exe }}
