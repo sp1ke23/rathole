@@ -18,6 +18,86 @@ async fn dual_listener_releases_tcp_when_udp_bind_fails() -> Result<()> {
     Ok(())
 }
 
+#[tokio::test]
+async fn dual_service_requests_fresh_udp_channel_after_prewarm_is_drained() -> Result<()> {
+    time::timeout(Duration::from_secs(30), async {
+        let tunnel_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let (mut control_peer, control_stream) = open_tcp_pair(&tunnel_listener).await?;
+        let (reserved_tcp, reserved_udp) = bind_tcp_and_udp("127.0.0.1:0").await?;
+        let exposed_addr = reserved_udp.local_addr()?;
+        let visitor = UdpSocket::bind("127.0.0.1:0").await?;
+        visitor.connect(exposed_addr).await?;
+        drop((reserved_tcp, reserved_udp));
+
+        let handle = ControlChannelHandle::<TcpTransport>::new(
+            control_stream,
+            ServerServiceConfig {
+                service_type: ServiceType::TcpAndUdp,
+                bind_addr: exposed_addr.to_string(),
+                ..ServerServiceConfig::with_name("backend")
+            },
+            0,
+        );
+
+        let prewarm_count = TCP_POOL_SIZE + UDP_POOL_SIZE;
+        let mut prewarmed_peers = Vec::with_capacity(prewarm_count);
+        for _ in 0..prewarm_count {
+            let command = protocol::read_control_cmd(&mut control_peer).await?;
+            assert!(matches!(command, ControlChannelCmd::CreateDataChannel));
+            let (peer, stream) = open_tcp_pair(&tunnel_listener).await?;
+            handle.data_ch_tx.send(stream).await?;
+            prewarmed_peers.push(peer);
+        }
+
+        // Withhold every replacement until all of the original connections have failed.
+        for (index, mut peer) in prewarmed_peers.into_iter().enumerate() {
+            let command = protocol::read_data_cmd(&mut peer).await?;
+            assert!(matches!(command, DataChannelCmd::StartForwardUdp));
+            drop(peer);
+
+            let command = time::timeout(
+                Duration::from_secs(3),
+                protocol::read_control_cmd(&mut control_peer),
+            )
+            .await
+            .with_context(|| {
+                format!(
+                    "No replacement request after UDP channel {} closed",
+                    index + 1
+                )
+            })??;
+            assert!(matches!(command, ControlChannelCmd::CreateDataChannel));
+        }
+
+        let (mut fresh_peer, fresh_stream) = open_tcp_pair(&tunnel_listener).await?;
+        handle.data_ch_tx.send(fresh_stream).await?;
+        let command = protocol::read_data_cmd(&mut fresh_peer).await?;
+        assert!(matches!(command, DataChannelCmd::StartForwardUdp));
+
+        let payload = b"UDP over a fresh channel";
+        visitor.send(payload).await?;
+        let header_len = fresh_peer.read_u8().await?;
+        let packet = UdpTraffic::read(&mut fresh_peer, header_len).await?;
+        assert_eq!(packet.from, visitor.local_addr()?);
+        assert_eq!(packet.data.as_ref(), payload);
+        packet.write(&mut fresh_peer).await?;
+        let mut reply = [0; UDP_BUFFER_SIZE];
+        let len = visitor.recv(&mut reply).await?;
+        assert_eq!(&reply[..len], payload);
+        Ok(())
+    })
+    .await
+    .context("Timed out testing UDP recovery with an empty prewarm pool")?
+}
+
+async fn open_tcp_pair(listener: &TcpListener) -> io::Result<(TcpStream, TcpStream)> {
+    let (peer, (stream, _)) = tokio::try_join!(
+        TcpStream::connect(listener.local_addr()?),
+        listener.accept()
+    )?;
+    Ok((peer, stream))
+}
+
 #[cfg(feature = "client")]
 mod forwarding {
     use super::*;
