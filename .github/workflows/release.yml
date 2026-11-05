@@ -22,29 +22,23 @@ jobs:
           - os: ubuntu-latest
             target: x86_64-unknown-linux-musl
             exe: rathole
-            cross: false
           - os: ubuntu-26.04-arm
             target: aarch64-unknown-linux-musl
             exe: rathole
-            cross: false
 
           - os: macos-15-intel
             target: x86_64-apple-darwin
             exe: rathole
-            cross: false
           - os: macos-15
             target: aarch64-apple-darwin
             exe: rathole
-            cross: false
 
           - os: windows-latest
             target: x86_64-pc-windows-msvc
             exe: rathole.exe
-            cross: false
           - os: windows-11-arm
             target: aarch64-pc-windows-msvc
             exe: rathole.exe
-            cross: false
     env:
       CARGO_FEATURE_ARGS: ${{ endsWith(matrix.target, '-linux-musl') && '--features vendored-tls' || '' }}
     steps:

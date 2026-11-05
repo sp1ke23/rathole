@@ -1,8 +1,22 @@
 use super::*;
 
+const LOOPBACK: &str = "127.0.0.1:0";
+
+async fn bind_ephemeral_tcp_and_udp() -> io::Result<(TcpListener, UdpSocket)> {
+    // A port assigned to TCP may already be in use by UDP.
+    let mut attempts_left = 16;
+    loop {
+        attempts_left -= 1;
+        match bind_tcp_and_udp(LOOPBACK).await {
+            Err(error) if error.kind() == io::ErrorKind::AddrInUse && attempts_left > 0 => {}
+            result => return result,
+        }
+    }
+}
+
 #[tokio::test]
 async fn dual_listener_uses_one_ephemeral_port() -> Result<()> {
-    let (tcp, udp) = bind_tcp_and_udp("127.0.0.1:0").await?;
+    let (tcp, udp) = bind_ephemeral_tcp_and_udp().await?;
     assert_ne!(tcp.local_addr()?.port(), 0);
     assert_eq!(tcp.local_addr()?, udp.local_addr()?);
     Ok(())
@@ -10,7 +24,7 @@ async fn dual_listener_uses_one_ephemeral_port() -> Result<()> {
 
 #[tokio::test]
 async fn dual_listener_releases_tcp_when_udp_bind_fails() -> Result<()> {
-    let udp = UdpSocket::bind("127.0.0.1:0").await?;
+    let udp = UdpSocket::bind(LOOPBACK).await?;
     let addr = udp.local_addr()?;
     let error = bind_tcp_and_udp(&addr.to_string()).await.unwrap_err();
     assert_eq!(error.kind(), io::ErrorKind::AddrInUse);
@@ -21,11 +35,11 @@ async fn dual_listener_releases_tcp_when_udp_bind_fails() -> Result<()> {
 #[tokio::test]
 async fn dual_service_requests_fresh_udp_channel_after_prewarm_is_drained() -> Result<()> {
     time::timeout(Duration::from_secs(30), async {
-        let tunnel_listener = TcpListener::bind("127.0.0.1:0").await?;
+        let tunnel_listener = TcpListener::bind(LOOPBACK).await?;
         let (mut control_peer, control_stream) = open_tcp_pair(&tunnel_listener).await?;
-        let (reserved_tcp, reserved_udp) = bind_tcp_and_udp("127.0.0.1:0").await?;
+        let (reserved_tcp, reserved_udp) = bind_ephemeral_tcp_and_udp().await?;
         let exposed_addr = reserved_udp.local_addr()?;
-        let visitor = UdpSocket::bind("127.0.0.1:0").await?;
+        let visitor = UdpSocket::bind(LOOPBACK).await?;
         visitor.connect(exposed_addr).await?;
         drop((reserved_tcp, reserved_udp));
 
@@ -107,7 +121,6 @@ mod forwarding {
     use tokio::sync::oneshot;
 
     const SERVICE: &str = "backend";
-    const LOOPBACK: &str = "127.0.0.1:0";
     const RETRY_DELAY: Duration = Duration::from_millis(20);
 
     #[tokio::test]
@@ -118,16 +131,29 @@ mod forwarding {
     }
 
     async fn exercise_dual_service() -> Result<()> {
-        let (backend_tcp, backend_udp) = bind_tcp_and_udp(LOOPBACK).await?;
+        let (backend_tcp, backend_udp) = bind_ephemeral_tcp_and_udp()
+            .await
+            .context("Failed to bind the TCP and UDP echo backend")?;
         let backend_addr = backend_tcp.local_addr()?;
-        let (exposed_tcp, exposed_udp) = bind_tcp_and_udp(LOOPBACK).await?;
+        let (exposed_tcp, exposed_udp) = bind_ephemeral_tcp_and_udp()
+            .await
+            .context("Failed to reserve the exposed TCP and UDP port")?;
         let exposed_addr = exposed_tcp.local_addr()?;
-        let proxy = TcpListener::bind(LOOPBACK).await?;
+        let proxy = TcpListener::bind(LOOPBACK)
+            .await
+            .context("Failed to bind the tunnel proxy")?;
         let proxy_addr = proxy.local_addr()?;
-        let control = TcpListener::bind(LOOPBACK).await?;
+        let control = TcpListener::bind(LOOPBACK)
+            .await
+            .context("Failed to reserve the server control port")?;
         let control_addr = control.local_addr()?;
-        let visitor_udp = UdpSocket::bind(LOOPBACK).await?;
-        visitor_udp.connect(exposed_addr).await?;
+        let visitor_udp = UdpSocket::bind(LOOPBACK)
+            .await
+            .context("Failed to bind the UDP visitor socket")?;
+        visitor_udp
+            .connect(exposed_addr)
+            .await
+            .with_context(|| format!("Failed to connect the UDP visitor to {exposed_addr}"))?;
         drop((exposed_tcp, exposed_udp, control));
 
         tokio::spawn(echo_tcp(backend_tcp));
@@ -188,7 +214,9 @@ mod forwarding {
             .start
             .send(())
             .map_err(|_| anyhow!("UDP tunnel closed"))?;
-        let mut tcp = TcpStream::connect(exposed_addr).await?;
+        let mut tcp = TcpStream::connect(exposed_addr)
+            .await
+            .with_context(|| format!("Failed to connect the TCP visitor to {exposed_addr}"))?;
         tokio::try_join!(
             check_tcp_echo(&mut tcp, b"initial TCP"),
             check_udp_echo(&visitor_udp, b"initial UDP"),
@@ -213,7 +241,11 @@ mod forwarding {
 
         client_shutdown.send(true)?;
         client.await??;
-        wait_for_listeners_to_close(exposed_addr).await?;
+        wait_for_listeners_to_close(exposed_addr)
+            .await
+            .with_context(|| {
+                format!("Failed to verify release of {exposed_addr} after client shutdown")
+            })?;
 
         let (_client_updates, client_update_rx) = mpsc::channel(1);
         let client = tokio::spawn(crate::client::run_client(
@@ -226,7 +258,9 @@ mod forwarding {
             .start
             .send(())
             .map_err(|_| anyhow!("UDP tunnel closed"))?;
-        let mut tcp = TcpStream::connect(exposed_addr).await?;
+        let mut tcp = TcpStream::connect(exposed_addr)
+            .await
+            .with_context(|| format!("Failed to reconnect the TCP visitor to {exposed_addr}"))?;
         tokio::try_join!(
             check_tcp_echo(&mut tcp, b"reconnected TCP"),
             check_udp_echo(&visitor_udp, b"reconnected UDP"),
@@ -238,7 +272,11 @@ mod forwarding {
                 SERVICE.into(),
             )))
             .await?;
-        wait_for_listeners_to_close(exposed_addr).await?;
+        wait_for_listeners_to_close(exposed_addr)
+            .await
+            .with_context(|| {
+                format!("Failed to verify release of {exposed_addr} after service removal")
+            })?;
         client_shutdown.send(true)?;
         server_shutdown.send(true)?;
         client.await??;
