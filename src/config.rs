@@ -84,6 +84,8 @@ pub enum ServiceType {
     Tcp,
     #[serde(rename = "udp")]
     Udp,
+    #[serde(rename = "tcp_and_udp")]
+    TcpAndUdp,
 }
 
 fn default_service_type() -> ServiceType {
@@ -399,6 +401,52 @@ mod tests {
         for p in paths {
             let s = fs::read_to_string(p)?;
             assert!(Config::from_str(&s).is_err());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn test_service_types() -> Result<()> {
+        for (kind, expected) in [
+            ("", Some(ServiceType::Tcp)),
+            ("type = \"tcp\"", Some(ServiceType::Tcp)),
+            ("type = \"udp\"", Some(ServiceType::Udp)),
+            ("type = \"tcp_and_udp\"", Some(ServiceType::TcpAndUdp)),
+            ("type = \"unknown\"", None),
+        ] {
+            let client = Config::from_str(&format!(
+                r#"
+[client]
+remote_addr = "127.0.0.1:2333"
+default_token = "test"
+[client.services.backend]
+local_addr = "127.0.0.1:8080"
+{kind}
+"#
+            ));
+            let server = Config::from_str(&format!(
+                r#"
+[server]
+bind_addr = "127.0.0.1:2333"
+default_token = "test"
+[server.services.backend]
+bind_addr = "127.0.0.1:5202"
+{kind}
+"#
+            ));
+            if let Some(expected) = expected {
+                assert_eq!(
+                    client?.client.unwrap().services["backend"].service_type,
+                    expected
+                );
+                assert_eq!(
+                    server?.server.unwrap().services["backend"].service_type,
+                    expected
+                );
+            } else {
+                assert!(client.is_err());
+                assert!(server.is_err());
+            }
         }
         Ok(())
     }

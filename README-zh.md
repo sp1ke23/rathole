@@ -130,7 +130,7 @@ remote_public_key = "key_encoded_in_base64" # Optional
 tls = true # If `true` then it will use settings in `client.transport.tls`
 
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
+type = "tcp" # 可选。转发协议可选 "tcp"、"udp" 或 "tcp_and_udp"，默认为 "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 # local_addr_if = "lo" # 可选。指定客户端访问 local_addr 时使用的 Linux 网卡，适用于 TCP 和 UDP
@@ -173,6 +173,22 @@ nodelay = true # Optional. Same as the client
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
+```
+
+要在同一端口同时转发 TCP 和 UDP，在客户端和服务端各配置一条同名服务，并将 `type` 设为 `"tcp_and_udp"`。启用前请先升级两端。下面的示例假设两端已配置相同的 `default_token`。
+
+```toml
+# client.toml
+[client.services.app]
+type = "tcp_and_udp"
+local_addr = "127.0.0.1:8080"
+```
+
+```toml
+# server.toml
+[server.services.app]
+type = "tcp_and_udp"
+bind_addr = "0.0.0.0:5202"
 ```
 
 ### Logging

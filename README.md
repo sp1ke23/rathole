@@ -132,7 +132,7 @@ remote_public_key = "key_encoded_in_base64" # Optional
 tls = true # If `true` then it will use settings in `client.transport.tls`
 
 [client.services.service1] # A service that needs forwarding. The name `service1` can change arbitrarily, as long as identical to the name in the server's configuration
-type = "tcp" # Optional. The protocol that needs forwarding. Possible values: ["tcp", "udp"]. Default: "tcp"
+type = "tcp" # Optional. Forwarding protocol: "tcp", "udp", or "tcp_and_udp". Default: "tcp"
 token = "whatever" # Necessary if `client.default_token` not set
 local_addr = "127.0.0.1:1081" # Necessary. The address of the service that needs to be forwarded
 # local_addr_if = "lo" # Optional. Linux interface for TCP and UDP connections to local_addr
@@ -175,6 +175,22 @@ nodelay = true # Optional. Same as the client
 
 [server.services.service2]
 bind_addr = "0.0.0.1:8082"
+```
+
+To forward TCP and UDP on the same port, set `type = "tcp_and_udp"` in one service on each side. Upgrade both the client and the server before enabling this type. The following example assumes matching `default_token` values in the existing client and server configuration.
+
+```toml
+# client.toml
+[client.services.app]
+type = "tcp_and_udp"
+local_addr = "127.0.0.1:8080"
+```
+
+```toml
+# server.toml
+[server.services.app]
+type = "tcp_and_udp"
+bind_addr = "0.0.0.0:5202"
 ```
 
 ### Logging

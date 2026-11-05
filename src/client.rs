@@ -217,13 +217,19 @@ async fn run_data_channel<T: Transport>(args: Arc<RunDataChannelArgs<T>>) -> Res
     // Forward
     match read_data_cmd(&mut conn).await? {
         DataChannelCmd::StartForwardTcp => {
-            if args.service.service_type != ServiceType::Tcp {
+            if !matches!(
+                args.service.service_type,
+                ServiceType::Tcp | ServiceType::TcpAndUdp
+            ) {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
             run_data_channel_for_tcp::<T>(conn, &args.service).await?;
         }
         DataChannelCmd::StartForwardUdp => {
-            if args.service.service_type != ServiceType::Udp {
+            if !matches!(
+                args.service.service_type,
+                ServiceType::Udp | ServiceType::TcpAndUdp
+            ) {
                 bail!("Expect UDP traffic. Please check the configuration.")
             }
             run_data_channel_for_udp::<T>(conn, &args.service).await?;

@@ -19,7 +19,7 @@ use std::sync::Arc;
 use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
-use tokio::sync::{broadcast, mpsc, RwLock};
+use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::time;
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
@@ -235,7 +235,8 @@ impl<T: 'static + Transport> Server<T> {
                 }
                 ServerServiceChange::Delete(s) => {
                     let hash = protocol::digest(s.as_bytes());
-                    let _ = self.services.write().await.remove(&hash);
+                    let mut wg = self.services.write().await;
+                    let _ = wg.remove(&hash);
 
                     let mut wg = self.control_channels.write().await;
                     let _ = wg.remove1(&hash);
@@ -329,6 +330,14 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
         );
         bail!("Service {} failed the authentication", service_name);
     } else {
+        // A reload may have replaced the configuration while authentication was in flight.
+        let services = services.read().await;
+        if services.get(&service_digest) != Some(&service_config) {
+            bail!(
+                "Configuration changed during authentication for service {}",
+                service_name
+            );
+        }
         let mut h = control_channels.write().await;
 
         // If there's already a control channel for the service, then drop the old one.
@@ -366,22 +375,19 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
     debug!("Try to handshake a data channel");
 
     // Validate
-    let control_channels_guard = control_channels.read().await;
-    match control_channels_guard.get2(&nonce) {
-        Some(handle) => {
-            T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
-
-            // Send the data channel to the corresponding control channel
-            handle
-                .data_ch_tx
-                .send(conn)
-                .await
-                .with_context(|| "Data channel for a stale control channel")?;
-        }
-        None => {
+    let data_ch_tx = {
+        let control_channels = control_channels.read().await;
+        let Some(handle) = control_channels.get2(&nonce) else {
             warn!("Data channel has incorrect nonce");
-        }
-    }
+            return Ok(());
+        };
+        T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
+        handle.data_ch_tx.clone()
+    };
+    data_ch_tx
+        .send(conn)
+        .await
+        .with_context(|| "Data channel for a stale control channel")?;
     Ok(())
 }
 
@@ -405,7 +411,7 @@ where
         heartbeat_interval: u64,
     ) -> ControlChannelHandle<T> {
         // Create a shutdown channel
-        let (shutdown_tx, shutdown_rx) = broadcast::channel::<bool>(1);
+        let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<bool>(1);
 
         // Store data channels
         let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
@@ -417,6 +423,7 @@ where
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
+            ServiceType::TcpAndUdp => TCP_POOL_SIZE + UDP_POOL_SIZE,
         };
 
         for _i in 0..pool_size {
@@ -425,55 +432,27 @@ where
             };
         }
 
-        let shutdown_rx_clone = shutdown_tx.subscribe();
         let bind_addr = service.bind_addr.clone();
-        match service.service_type {
-            ServiceType::Tcp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_tcp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-            ServiceType::Udp => tokio::spawn(
-                async move {
-                    if let Err(e) = run_udp_connection_pool::<T>(
-                        bind_addr,
-                        data_ch_rx,
-                        data_ch_req_tx,
-                        shutdown_rx_clone,
-                    )
-                    .await
-                    .with_context(|| "Failed to run TCP connection pool")
-                    {
-                        error!("{:#}", e);
-                    }
-                }
-                .instrument(Span::current()),
-            ),
-        };
+        let service_type = service.service_type;
+        let bind_shutdown_rx = shutdown_tx.subscribe();
 
-        // Create the control channel
         let ch = ControlChannel::<T> {
             conn,
-            shutdown_rx,
             data_ch_req_rx,
             heartbeat_interval,
         };
 
-        // Run the control channel
+        // The control session owns the listeners and pending data channels.
         tokio::spawn(
             async move {
-                if let Err(err) = ch.run().await {
+                let result = tokio::select! {
+                    result = ch.run() => result,
+                    result = run_connection_pools::<T>(
+                        service_type, bind_addr, data_ch_rx, data_ch_req_tx, bind_shutdown_rx,
+                    ) => result,
+                    _ = shutdown_rx.recv() => Ok(()),
+                };
+                if let Err(err) = result {
                     error!("{:#}", err);
                 }
             }
@@ -491,7 +470,6 @@ where
 // Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
 struct ControlChannel<T: Transport> {
     conn: T::Stream,                               // The connection of control channel
-    shutdown_rx: broadcast::Receiver<bool>,        // Receives the shutdown signal
     data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
     heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
 }
@@ -514,7 +492,8 @@ impl<T: Transport> ControlChannel<T> {
         let create_ch_cmd = bincode::serialize(&ControlChannelCmd::CreateDataChannel).unwrap();
         let heartbeat = bincode::serialize(&ControlChannelCmd::HeartBeat).unwrap();
 
-        // Wait for data channel requests and the shutdown signal
+        // The client sends no control messages after authentication. A read detects
+        // disconnects even if heartbeats are disabled and the service is idle.
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
@@ -536,8 +515,10 @@ impl<T: Transport> ControlChannel<T> {
                                 break;
                             }
                 }
-                // Wait for the shutdown signal
-                _ = self.shutdown_rx.recv() => {
+                received = self.conn.read_u8() => {
+                    if received.is_ok() {
+                        warn!("Unexpected byte on the control channel");
+                    }
                     break;
                 }
             }
@@ -549,154 +530,171 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
-fn tcp_listen_and_send(
-    addr: String,
+async fn run_connection_pools<T: Transport>(
+    service_type: ServiceType,
+    bind_addr: String,
+    data_ch_rx: mpsc::Receiver<T::Stream>,
     data_ch_req_tx: mpsc::UnboundedSender<bool>,
     mut shutdown_rx: broadcast::Receiver<bool>,
-) -> mpsc::Receiver<TcpStream> {
-    let (tx, rx) = mpsc::channel(CHAN_SIZE);
+) -> Result<()> {
+    let data_ch_rx = Mutex::new(data_ch_rx);
+    let log_retry = |error, delay| {
+        warn!(
+            "Failed to listen at {}: {:#}. Retry in {:?}",
+            bind_addr, error, delay
+        )
+    };
 
-    tokio::spawn(async move {
-        let l = retry_notify_with_deadline(listen_backoff(),  || async {
-            Ok(TcpListener::bind(&addr).await?)
-        }, |e, duration| {
-            error!("{:#}. Retry in {:?}", e, duration);
-        }, &mut shutdown_rx).await
-        .with_context(|| "Failed to listen for the service");
+    match service_type {
+        ServiceType::Tcp => {
+            let listener = retry_notify_with_deadline(
+                listen_backoff(),
+                || async { Ok(TcpListener::bind(&bind_addr).await?) },
+                log_retry,
+                &mut shutdown_rx,
+            )
+            .await?;
+            run_tcp_connection_pool::<T>(listener, &data_ch_rx, &data_ch_req_tx).await
+        }
+        ServiceType::Udp => {
+            let socket = retry_notify_with_deadline(
+                listen_backoff(),
+                || async { Ok(UdpSocket::bind(&bind_addr).await?) },
+                log_retry,
+                &mut shutdown_rx,
+            )
+            .await?;
+            run_udp_connection_pool::<T>(socket, &data_ch_rx, None).await
+        }
+        ServiceType::TcpAndUdp => {
+            let (listener, socket) = retry_notify_with_deadline(
+                listen_backoff(),
+                || async { Ok(bind_tcp_and_udp(&bind_addr).await?) },
+                log_retry,
+                &mut shutdown_rx,
+            )
+            .await?;
+            tokio::try_join!(
+                run_tcp_connection_pool::<T>(listener, &data_ch_rx, &data_ch_req_tx),
+                run_udp_connection_pool::<T>(socket, &data_ch_rx, Some(&data_ch_req_tx)),
+            )?;
+            Ok(())
+        }
+    }
+}
 
-        let l: TcpListener = match l {
-            Ok(v) => v,
-            Err(e) => {
-                error!("{:#}", e);
-                return;
+async fn bind_tcp_and_udp(addr: &str) -> io::Result<(TcpListener, UdpSocket)> {
+    let listener = TcpListener::bind(addr).await?;
+    let socket = UdpSocket::bind(listener.local_addr()?).await?;
+    Ok((listener, socket))
+}
+
+async fn accept_tcp_visitors(
+    listener: TcpListener,
+    visitor_tx: mpsc::Sender<TcpStream>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+) -> Result<()> {
+    let mut backoff = listen_backoff();
+    loop {
+        match listener.accept().await {
+            Ok((incoming, addr)) => {
+                data_ch_req_tx
+                    .send(true)
+                    .context("Failed to request a TCP data channel")?;
+                backoff.reset();
+                debug!("New visitor from {}", addr);
+                visitor_tx.send(incoming).await?;
             }
-        };
-
-        info!("Listening at {}", &addr);
-
-        // Retry at least every 1s
-        let mut backoff = ExponentialBackoff {
-            max_interval: Duration::from_secs(1),
-            max_elapsed_time: None,
-            ..Default::default()
-        };
-
-        // Wait for visitors and the shutdown signal
-        loop {
-            tokio::select! {
-                val = l.accept() => {
-                    match val {
-                        Err(e) => {
-                            // `l` is a TCP listener so this must be a IO error
-                            // Possibly a EMFILE. So sleep for a while
-                            error!("{}. Sleep for a while", e);
-                            if let Some(d) = backoff.next_backoff() {
-                                time::sleep(d).await;
-                            } else {
-                                // This branch will never be reached for current backoff policy
-                                error!("Too many retries. Aborting...");
-                                break;
-                            }
-                        }
-                        Ok((incoming, addr)) => {
-                            // For every visitor, request to create a data channel
-                            if data_ch_req_tx.send(true).with_context(|| "Failed to send data chan create request").is_err() {
-                                // An error indicates the control channel is broken
-                                // So break the loop
-                                break;
-                            }
-
-                            backoff.reset();
-
-                            debug!("New visitor from {}", addr);
-
-                            // Send the visitor to the connection pool
-                            let _ = tx.send(incoming).await;
-                        }
-                    }
-                },
-                _ = shutdown_rx.recv() => {
-                    break;
-                }
+            Err(error) => {
+                let Some(delay) = backoff.next_backoff() else {
+                    return Err(error.into());
+                };
+                error!(
+                    "Failed to accept TCP visitor: {}. Retry in {:?}",
+                    error, delay
+                );
+                time::sleep(delay).await;
             }
         }
+    }
+}
 
-        info!("TCPListener shutdown");
-    }.instrument(Span::current()));
-
-    rx
+async fn take_data_channel<S>(data_ch_rx: &Mutex<mpsc::Receiver<S>>) -> Result<S> {
+    data_ch_rx
+        .lock()
+        .await
+        .recv()
+        .await
+        .context("No available data channels")
 }
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
-    bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    shutdown_rx: broadcast::Receiver<bool>,
+    listener: TcpListener,
+    data_ch_rx: &Mutex<mpsc::Receiver<T::Stream>>,
+    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
 ) -> Result<()> {
-    let mut visitor_rx = tcp_listen_and_send(bind_addr, data_ch_req_tx.clone(), shutdown_rx);
+    info!("Listening for TCP at {}", listener.local_addr()?);
+    let (visitor_tx, mut visitor_rx) = mpsc::channel::<TcpStream>(CHAN_SIZE);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
-    'pool: while let Some(mut visitor) = visitor_rx.recv().await {
-        loop {
-            if let Some(mut ch) = data_ch_rx.recv().await {
-                if ch.write_all(&cmd).await.is_ok() {
-                    tokio::spawn(async move {
-                        let _ = copy_bidirectional(&mut ch, &mut visitor).await;
-                    });
-                    break;
-                } else {
-                    // Current data channel is broken. Request for a new one
-                    if data_ch_req_tx.send(true).is_err() {
-                        break 'pool;
+    tokio::select! {
+        result = accept_tcp_visitors(listener, visitor_tx, data_ch_req_tx) => result,
+        result = async {
+            while let Some(mut visitor) = visitor_rx.recv().await {
+                loop {
+                    let mut ch = take_data_channel(data_ch_rx).await?;
+                    if ch.write_all(&cmd).await.is_ok() && ch.flush().await.is_ok() {
+                        tokio::spawn(async move {
+                            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
+                        });
+                        break;
                     }
+                    data_ch_req_tx.send(true).context("Failed to replace a TCP data channel")?;
                 }
-            } else {
-                break 'pool;
             }
-        }
+            Ok(())
+        } => result,
     }
-
-    info!("Shutdown");
-    Ok(())
 }
 
 #[instrument(skip_all)]
 async fn run_udp_connection_pool<T: Transport>(
-    bind_addr: String,
-    mut data_ch_rx: mpsc::Receiver<T::Stream>,
-    _data_ch_req_tx: mpsc::UnboundedSender<bool>,
-    mut shutdown_rx: broadcast::Receiver<bool>,
+    socket: UdpSocket,
+    data_ch_rx: &Mutex<mpsc::Receiver<T::Stream>>,
+    replacement_requests: Option<&mpsc::UnboundedSender<bool>>,
 ) -> Result<()> {
-    // TODO: Load balance
-
-    let l = retry_notify_with_deadline(
-        listen_backoff(),
-        || async { Ok(UdpSocket::bind(&bind_addr).await?) },
-        |e, duration| {
-            warn!("{:#}. Retry in {:?}", e, duration);
-        },
-        &mut shutdown_rx,
-    )
-    .await
-    .with_context(|| "Failed to listen for the service")?;
-
-    info!("Listening at {}", &bind_addr);
-
+    info!("Listening for UDP at {}", socket.local_addr()?);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
+    let mut backoff = listen_backoff();
+    loop {
+        let conn = take_data_channel(data_ch_rx).await?;
+        let Err(error) = forward_udp(&socket, conn, &cmd).await else {
+            return Ok(());
+        };
+        let (Some(requests), Some(delay)) = (replacement_requests, backoff.next_backoff()) else {
+            return Err(error);
+        };
+        warn!("UDP data channel ended: {:#}. Retry in {:?}", error, delay);
+        time::sleep(delay).await;
+        requests
+            .send(true)
+            .context("Failed to replace a UDP data channel")?;
+    }
+}
 
-    // Receive one data channel
-    let mut conn = data_ch_rx
-        .recv()
-        .await
-        .ok_or_else(|| anyhow!("No available data channels"))?;
-    conn.write_all(&cmd).await?;
+async fn forward_udp<S>(socket: &UdpSocket, mut conn: S, cmd: &[u8]) -> Result<()>
+where
+    S: io::AsyncRead + io::AsyncWrite + Unpin,
+{
+    conn.write_all(cmd).await?;
+    conn.flush().await?;
 
     let mut buf = [0u8; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
             // Forward inbound traffic to the client
-            val = l.recv_from(&mut buf) => {
+            val = socket.recv_from(&mut buf) => {
                 let (n, from) = val?;
                 UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
             },
@@ -704,16 +702,11 @@ async fn run_udp_connection_pool<T: Transport>(
             // Forward outbound traffic from the client to the visitor
             hdr_len = conn.read_u8() => {
                 let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                l.send_to(&t.data, t.from).await?;
-            }
-
-            _ = shutdown_rx.recv() => {
-                break;
+                socket.send_to(&t.data, t.from).await?;
             }
         }
     }
-
-    debug!("UDP pool dropped");
-
-    Ok(())
 }
+
+#[cfg(test)]
+mod tests;
