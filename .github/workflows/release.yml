@@ -12,7 +12,7 @@ env:
 
 jobs:
   release:
-    name: Cross build for ${{ matrix.target }}
+    name: Build for ${{ matrix.target }}
     runs-on: ${{ matrix.os }}
     permissions:
       contents: write
@@ -20,13 +20,13 @@ jobs:
       matrix:
         include:
           - os: ubuntu-latest
-            target: x86_64-unknown-linux-gnu
+            target: x86_64-unknown-linux-musl
             exe: rathole
             cross: false
-          - os: ubuntu-latest
+          - os: ubuntu-26.04-arm
             target: aarch64-unknown-linux-musl
             exe: rathole
-            cross: true
+            cross: false
 
           - os: macos-15-intel
             target: x86_64-apple-darwin
@@ -41,6 +41,12 @@ jobs:
             target: x86_64-pc-windows-msvc
             exe: rathole.exe
             cross: false
+          - os: windows-11-arm
+            target: aarch64-pc-windows-msvc
+            exe: rathole.exe
+            cross: false
+    env:
+      CARGO_FEATURE_ARGS: ${{ endsWith(matrix.target, '-linux-musl') && '--features vendored-tls' || '' }}
     steps:
       - uses: actions/checkout@v2
       - uses: actions-rs/toolchain@v1
@@ -48,42 +54,41 @@ jobs:
           profile: minimal
           toolchain: 1.79
           default: true
-      
-      - name: Install OpenSSL
-        if: matrix.os == 'ubuntu-latest'
-        run: sudo apt-get install pkg-config libssl-dev
+
+      - name: Set up musl C compiler
+        if: endsWith(matrix.target, '-linux-musl')
+        env:
+          RUST_TARGET: ${{ matrix.target }}
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y musl-tools
+          target_key="${RUST_TARGET//-/_}"
+          echo "CC_${target_key}=musl-gcc" >> "$GITHUB_ENV"
       - name: Install OpenSSL
         if: startsWith(matrix.os, 'macos-')
         run: brew install openssl@3
-      
-      # Native build
+
       - name: Install target
-        if: matrix.cross == false
         run: rustup target add ${{ matrix.target }}
       - name: Run tests
-        if: matrix.cross == false
-        run: cargo test --release --target ${{ matrix.target }} --verbose 
+        run: cargo test --locked --release --target ${{ matrix.target }} --verbose ${{ env.CARGO_FEATURE_ARGS }}
       - name: Build release
-        if: matrix.cross == false 
-        run: cargo build --release --target ${{ matrix.target }}
-
-      # Cross build
-      - name: Install cross
-        if: matrix.cross
-        run: cargo install --locked --version 0.2.5 cross
-      - name: Run tests
-        if: matrix.cross
-        run: >-
-          cross test --release --target ${{ matrix.target }} --verbose --features embedded --no-default-features
-          --config 'env.RATHOLE_TEST_ALLOW_QEMU_DEVICE_EINVAL="1"'
-      - name: Build release
-        if: matrix.cross
-        run: cross build --release --target ${{ matrix.target }} --features embedded --no-default-features
+        run: cargo build --locked --release --target ${{ matrix.target }} ${{ env.CARGO_FEATURE_ARGS }}
+      - name: Verify static Linux binary
+        if: endsWith(matrix.target, '-linux-musl')
+        env:
+          RELEASE_BINARY: target/${{ matrix.target }}/release/${{ matrix.exe }}
+        run: |
+          elf_headers=$(readelf -lW -dW "$RELEASE_BINARY")
+          if grep -E '^[[:space:]]*INTERP[[:space:]]|\(NEEDED\)' <<< "$elf_headers"; then
+            echo 'Linux release binary must be statically linked.' >&2
+            exit 1
+          fi
 
       - name: Run UPX
         # Upx may not support some platforms. Ignore the errors
         continue-on-error: true
-        if: matrix.os == 'ubuntu-latest'
+        if: endsWith(matrix.target, '-linux-musl')
         uses: crazy-max/ghaction-upx@v1
         with:
           version: v5.3.0

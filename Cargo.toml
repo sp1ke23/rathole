@@ -19,6 +19,8 @@ server = []
 client = []
 # TLS support
 tls = ["tokio-native-tls"]
+# Build and statically link OpenSSL on Linux
+vendored-tls = ["tls", "tokio-native-tls/vendored"]
 # Noise support
 noise = ["snowstorm", "base64"]
 # Websocket support
