@@ -79,25 +79,16 @@ jobs:
             exit 1
           fi
 
-      - name: Run UPX
-        # Upx may not support some platforms. Ignore the errors
-        continue-on-error: true
-        if: endsWith(matrix.target, '-linux-musl')
-        uses: crazy-max/ghaction-upx@v1
-        with:
-          version: v5.3.0
-          files: target/${{ matrix.target }}/release/${{ matrix.exe }}
-          args: -q --best --lzma
       - uses: actions/upload-artifact@v7
         with:
           name: rathole-${{ matrix.target }}${{ runner.os == 'Windows' && '.exe' || '' }}
           path: target/${{ matrix.target }}/release/${{ matrix.exe }}
-      - name: Package Linux and macOS release
+      - name: Package Linux and macOS release (tar.gz)
         if: runner.os == 'Linux' || runner.os == 'macOS'
         run: >-
           tar -czf "target/${{ matrix.target }}/release/rathole-${{ matrix.target }}.tar.gz"
           -C "target/${{ matrix.target }}/release" "${{ matrix.exe }}"
-      - name: Zip Release
+      - name: Package Windows release (zip)
         if: runner.os == 'Windows'
         uses: TheDoctor0/zip-release@0.6.1
         with:
@@ -105,7 +96,7 @@ jobs:
           filename: rathole-${{ matrix.target }}.zip
           directory: target/${{ matrix.target }}/release/
           path: ${{ matrix.exe }}
-      - name: Publish
+      - name: Publish release
         uses: softprops/action-gh-release@v1
         if: startsWith(github.ref, 'refs/tags/')
         with:
