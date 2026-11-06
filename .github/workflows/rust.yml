@@ -61,17 +61,7 @@ jobs:
         run: cargo build
       - name: Run tests
         run: cargo test --verbose
-      - name: Package Linux and macOS artifact
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        run: tar -czf "target/debug/rathole-${{ matrix.target }}.tar.gz" -C target/debug "${{ matrix.exe }}"
-      - name: Upload Linux and macOS artifact
-        if: runner.os == 'Linux' || runner.os == 'macOS'
-        uses: actions/upload-artifact@v7
-        with:
-          path: target/debug/rathole-${{ matrix.target }}.tar.gz
-          archive: false
       - uses: actions/upload-artifact@v7
-        if: runner.os == 'Windows'
         with:
-          name: rathole-${{ matrix.target }}
+          name: rathole-${{ matrix.target }}${{ runner.os == 'Windows' && '.exe' || '' }}
           path: target/debug/${{ matrix.exe }}
