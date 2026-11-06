@@ -204,7 +204,6 @@ where
 #[cfg(all(test, feature = "client", target_os = "linux"))]
 mod tests {
     use super::*;
-    use std::{env, io};
     use tokio::{
         io::{AsyncReadExt, AsyncWriteExt},
         net::TcpListener,
@@ -222,24 +221,6 @@ mod tests {
         addresses
     }
 
-    fn assert_loopback_device(socket: SockRef<'_>) -> io::Result<()> {
-        match socket.device() {
-            Ok(device) => assert_eq!(device.as_deref(), Some(&b"lo"[..])),
-            Err(error)
-                if error.kind() == io::ErrorKind::InvalidInput
-                    && matches!(
-                        env::var("RATHOLE_TEST_ALLOW_QEMU_DEVICE_EINVAL").as_deref(),
-                        Ok("1")
-                    ) =>
-            {
-                // QEMU 6.1 forwards this option with a 4-byte buffer, which Linux rejects.
-                eprintln!("Skipping SO_BINDTODEVICE readback under QEMU: {error}");
-            }
-            Err(error) => return Err(error),
-        }
-        Ok(())
-    }
-
     #[tokio::test]
     async fn tcp_local_addr_if() -> Result<()> {
         for loopback in loopback_addrs() {
@@ -249,7 +230,10 @@ mod tests {
             unused.bind("127.0.0.1:0".parse()?)?;
             let addresses = [unused.local_addr()?, addr];
             let mut client = tcp_connect_local(&addresses[..], Some("lo")).await?;
-            assert_loopback_device(SockRef::from(&client))?;
+            assert_eq!(
+                SockRef::from(&client).device()?.as_deref(),
+                Some(&b"lo"[..])
+            );
 
             let (mut backend, _) = listener.accept().await?;
             client.write_all(b"ping").await?;
@@ -272,7 +256,10 @@ mod tests {
             let backend = UdpSocket::bind(loopback).await?;
             let addr = backend.local_addr()?;
             let client = udp_connect(addr, Some("lo")).await?;
-            assert_loopback_device(SockRef::from(&client))?;
+            assert_eq!(
+                SockRef::from(&client).device()?.as_deref(),
+                Some(&b"lo"[..])
+            );
 
             client.send(b"ping").await?;
             let mut buf = [0; 4];
