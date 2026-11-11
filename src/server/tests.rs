@@ -1,10 +1,99 @@
 use super::*;
 use crate::config::MaskedString;
+use crate::constants::UDP_BUFFER_SIZE;
 use std::net::SocketAddr;
 
 const LOOPBACK: &str = "127.0.0.1:0";
 const SERVICE: &str = "backend";
 const TOKEN: &str = "test-token";
+
+#[tokio::test]
+async fn tcp_visitor_skips_a_prewarmed_channel_at_eof() -> Result<()> {
+    time::timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind(LOOPBACK).await?;
+        let (mut stale_peer, stale) = open_tcp_pair(&listener).await?;
+        stale_peer.shutdown().await?;
+        assert_eq!(stale.peek(&mut [0]).await?, 0);
+        let (mut healthy_peer, healthy) = open_tcp_pair(&listener).await?;
+
+        let exposed = TcpListener::bind(LOOPBACK).await?;
+        let mut visitor = TcpStream::connect(exposed.local_addr()?).await?;
+        let (data_tx, data_rx) = mpsc::channel(2);
+        let (requests, _commands) = mpsc::channel(2);
+        data_tx.send(stale).await?;
+        data_tx.send(healthy).await?;
+        let pool = tokio::spawn(async move {
+            run_tcp_connection_pool::<TcpTransport>(exposed, &Mutex::new(data_rx), &requests).await
+        });
+
+        assert!(matches!(
+            protocol::read_data_cmd(&mut healthy_peer).await?,
+            DataChannelCmd::StartForwardTcp
+        ));
+        visitor.write_all(b"ping").await?;
+        let mut payload = [0; 4];
+        healthy_peer.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"ping");
+        healthy_peer.write_all(&payload).await?;
+        visitor.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"ping");
+        pool.abort();
+        Ok(())
+    })
+    .await
+    .context("TCP visitor did not reach the healthy prewarmed tunnel")?
+}
+
+#[tokio::test]
+async fn udp_pool_requests_replacements_after_discarding_invalid_tunnels() -> Result<()> {
+    time::timeout(Duration::from_secs(3), async {
+        let listener = TcpListener::bind(LOOPBACK).await?;
+        let (mut closed_peer, closed) = open_tcp_pair(&listener).await?;
+        closed_peer.shutdown().await?;
+        assert_eq!(closed.peek(&mut [0]).await?, 0);
+        let (mut noisy_peer, noisy) = open_tcp_pair(&listener).await?;
+        noisy_peer.write_u8(1).await?;
+        assert_eq!(noisy.peek(&mut [0]).await?, 1);
+
+        let socket = UdpSocket::bind(LOOPBACK).await?;
+        let visitor = UdpSocket::bind(LOOPBACK).await?;
+        visitor.connect(socket.local_addr()?).await?;
+        let (data_tx, data_rx) = mpsc::channel(2);
+        let (requests, mut commands) = mpsc::channel(2);
+        data_tx.send(closed).await?;
+        data_tx.send(noisy).await?;
+        let pool = tokio::spawn(async move {
+            run_udp_connection_pool::<TcpTransport>(socket, &Mutex::new(data_rx), &requests).await
+        });
+        commands
+            .recv()
+            .await
+            .context("Missing replacement for closed tunnel")?;
+        commands
+            .recv()
+            .await
+            .context("Missing replacement for tunnel with unsolicited data")?;
+
+        let (mut peer, healthy) = open_tcp_pair(&listener).await?;
+        data_tx.send(healthy).await?;
+        assert!(matches!(
+            protocol::read_data_cmd(&mut peer).await?,
+            DataChannelCmd::StartForwardUdp
+        ));
+        visitor.send(b"ping").await?;
+        let len = peer.read_u8().await?;
+        let packet = UdpTraffic::read(&mut peer, len).await?;
+        assert_eq!(packet.data.as_ref(), b"ping");
+        packet.write(&mut peer).await?;
+        let mut payload = [0; 4];
+        assert_eq!(visitor.recv(&mut payload).await?, payload.len());
+        assert_eq!(&payload, b"ping");
+        pool.abort();
+        Ok(())
+    })
+    .await
+    .context("UDP pool did not recover after discarding unusable tunnels")?
+}
 
 #[tokio::test]
 async fn retries_missing_data_channels_for_tcp_and_udp() -> Result<()> {
@@ -320,11 +409,15 @@ async fn silent_websocket_handshake_does_not_block_another_connection() -> Resul
 }
 
 async fn bind_ephemeral_tcp_and_udp() -> io::Result<(TcpListener, UdpSocket)> {
+    bind_ephemeral_tcp_and_udp_at(LOOPBACK).await
+}
+
+async fn bind_ephemeral_tcp_and_udp_at(addr: &str) -> io::Result<(TcpListener, UdpSocket)> {
     // A port assigned to TCP may already be in use by UDP.
     let mut attempts_left = 16;
     loop {
         attempts_left -= 1;
-        match bind_tcp_and_udp(LOOPBACK).await {
+        match bind_tcp_and_udp(addr).await {
             Err(error) if error.kind() == io::ErrorKind::AddrInUse && attempts_left > 0 => {}
             result => return result,
         }
@@ -447,17 +540,39 @@ mod forwarding {
 
     #[tokio::test]
     async fn dual_service_recovers_udp_and_reconnects() -> Result<()> {
-        time::timeout(Duration::from_secs(15), exercise_dual_service())
-            .await
-            .context("Timed out testing dual service forwarding")?
+        time::timeout(
+            Duration::from_secs(15),
+            exercise_dual_service(LOOPBACK, &[0, 2048, 2049, 4096]),
+        )
+        .await
+        .context("Timed out testing dual service forwarding")?
     }
 
-    async fn exercise_dual_service() -> Result<()> {
-        let (backend_tcp, backend_udp) = bind_ephemeral_tcp_and_udp()
+    #[tokio::test]
+    async fn dual_service_forwards_ipv6_udp_datagrams() -> Result<()> {
+        const IPV6_LOOPBACK: &str = "[::1]:0";
+        if let Err(error) = TcpListener::bind(IPV6_LOOPBACK).await {
+            eprintln!("IPv6 loopback unavailable: {error}");
+            return Ok(());
+        }
+        if let Err(error) = UdpSocket::bind(IPV6_LOOPBACK).await {
+            eprintln!("IPv6 UDP loopback unavailable: {error}");
+            return Ok(());
+        }
+        time::timeout(
+            Duration::from_secs(15),
+            exercise_dual_service(IPV6_LOOPBACK, &[4096]),
+        )
+        .await
+        .context("Timed out testing IPv6 forwarding")?
+    }
+
+    async fn exercise_dual_service(loopback: &str, sizes: &[usize]) -> Result<()> {
+        let (backend_tcp, backend_udp) = bind_ephemeral_tcp_and_udp_at(loopback)
             .await
             .context("Failed to bind the TCP and UDP echo backend")?;
         let backend_addr = backend_tcp.local_addr()?;
-        let (exposed_tcp, exposed_udp) = bind_ephemeral_tcp_and_udp()
+        let (exposed_tcp, exposed_udp) = bind_ephemeral_tcp_and_udp_at(loopback)
             .await
             .context("Failed to reserve the exposed TCP and UDP port")?;
         let exposed_addr = exposed_tcp.local_addr()?;
@@ -469,7 +584,7 @@ mod forwarding {
             .await
             .context("Failed to reserve the server control port")?;
         let control_addr = control.local_addr()?;
-        let visitor_udp = UdpSocket::bind(LOOPBACK)
+        let visitor_udp = UdpSocket::bind(loopback)
             .await
             .context("Failed to bind the UDP visitor socket")?;
         visitor_udp
@@ -543,6 +658,21 @@ mod forwarding {
             check_tcp_echo(&mut tcp, b"initial TCP"),
             check_udp_echo(&visitor_udp, b"initial UDP"),
         )?;
+        let second_visitor = UdpSocket::bind(loopback).await?;
+        second_visitor.connect(exposed_addr).await?;
+        for &size in sizes {
+            let first = vec![23; size];
+            let second = vec![191; size];
+            tokio::try_join!(
+                check_udp_echo(&visitor_udp, &first),
+                check_udp_echo(&second_visitor, &second),
+            )?;
+        }
+        // Some platforms impose a lower UDP socket limit than the IPv4 maximum.
+        #[cfg(target_os = "linux")]
+        if exposed_addr.is_ipv4() {
+            check_udp_echo(&visitor_udp, &vec![83; 65507]).await?;
+        }
 
         first_udp
             .disconnect
@@ -633,7 +763,7 @@ mod forwarding {
     }
 
     async fn echo_udp(socket: UdpSocket) -> io::Result<()> {
-        let mut buf = [0; UDP_BUFFER_SIZE];
+        let mut buf = vec![0; u16::MAX as usize];
         loop {
             let (len, from) = socket.recv_from(&mut buf).await?;
             socket.send_to(&buf[..len], from).await?;
@@ -650,8 +780,9 @@ mod forwarding {
 
     async fn check_udp_echo(socket: &UdpSocket, payload: &[u8]) -> Result<()> {
         socket.send(payload).await?;
-        let mut reply = [0; UDP_BUFFER_SIZE];
+        let mut reply = vec![0; u16::MAX as usize];
         let len = socket.recv(&mut reply).await?;
+        assert_eq!(len, payload.len(), "UDP echo length");
         assert_eq!(&reply[..len], payload);
         Ok(())
     }

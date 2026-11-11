@@ -1,6 +1,8 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, DATA_REQUEST_RETRY, NETWORK_IO_TIMEOUT, UDP_BUFFER_SIZE};
+use crate::constants::{
+    listen_backoff, DATA_REQUEST_RETRY, NETWORK_IO_TIMEOUT, UDP_DATAGRAM_BUFFER_SIZE,
+};
 use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -15,9 +17,12 @@ use backoff::ExponentialBackoff;
 
 use rand::RngCore;
 use std::collections::HashMap;
+use std::future::poll_fn;
+use std::pin::Pin;
 use std::sync::Arc;
+use std::task::Poll;
 use std::time::Duration;
-use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
+use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
 use tokio::task::JoinSet;
@@ -609,7 +614,7 @@ fn request_data_channel(requests: &mpsc::Sender<()>) -> Result<()> {
     }
 }
 
-async fn take_data_channel<S>(
+async fn take_data_channel<S: io::AsyncRead + Unpin>(
     data_ch_rx: &Mutex<mpsc::Receiver<S>>,
     requests: &mpsc::Sender<()>,
 ) -> Result<S> {
@@ -619,7 +624,26 @@ async fn take_data_channel<S>(
             time::timeout(DATA_REQUEST_RETRY, channels.recv()).await
         };
         match received {
-            Ok(channel) => return channel.context("Data channel pool closed"),
+            Ok(channel) => {
+                let mut channel = channel.context("Data channel pool closed")?;
+                // Poll once after releasing the shared receiver. The peer sends no
+                // application bytes until it has received StartForward.
+                let mut byte = [0];
+                let mut buf = ReadBuf::new(&mut byte);
+                let readiness =
+                    poll_fn(|cx| Poll::Ready(Pin::new(&mut channel).poll_read(cx, &mut buf))).await;
+                match readiness {
+                    Poll::Pending => return Ok(channel),
+                    Poll::Ready(Err(error)) => debug!("Discarding prewarmed channel: {}", error),
+                    Poll::Ready(Ok(())) if buf.filled().is_empty() => {
+                        debug!("Discarding prewarmed channel at EOF");
+                    }
+                    Poll::Ready(Ok(())) => {
+                        debug!("Discarding prewarmed channel with unexpected data")
+                    }
+                }
+                request_data_channel(requests)?;
+            }
             Err(_) => {
                 warn!("No data channel arrived. Requesting another");
                 request_data_channel(requests)?;
@@ -628,7 +652,7 @@ async fn take_data_channel<S>(
     }
 }
 
-async fn start_tcp_forward<S: io::AsyncWrite + Unpin>(
+async fn start_tcp_forward<S: io::AsyncRead + io::AsyncWrite + Unpin>(
     data_ch_rx: &Mutex<mpsc::Receiver<S>>,
     requests: &mpsc::Sender<()>,
     cmd: &[u8],
@@ -712,7 +736,7 @@ where
 
     let (mut rd, mut wr) = io::split(conn);
     let inbound = async {
-        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        let mut buf = vec![0; UDP_DATAGRAM_BUFFER_SIZE];
         loop {
             let (n, from) = socket.recv_from(&mut buf).await?;
             UdpTraffic::write_slice(&mut wr, from, &buf[..n]).await?;

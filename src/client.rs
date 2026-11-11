@@ -12,11 +12,12 @@ use backoff::ExponentialBackoff;
 use backoff::{backoff::Backoff, future::retry_notify};
 use bytes::Bytes;
 use std::collections::{hash_map::Entry, HashMap};
+use std::future::Future;
 use std::net::SocketAddr;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::UdpSocket;
-use tokio::sync::{broadcast, mpsc, oneshot};
+use tokio::sync::{broadcast, mpsc, oneshot, OwnedSemaphorePermit, Semaphore};
 use tokio::task::JoinSet;
 use tokio::time::{self, Duration, Instant};
 use tracing::{debug, error, info, instrument, warn, Instrument, Span};
@@ -30,7 +31,7 @@ use crate::transport::WebsocketTransport;
 
 use crate::constants::{
     run_control_chan_backoff, CONTROL_CONNECT_TIMEOUT, DATA_CONNECT_TIMEOUT, NETWORK_IO_TIMEOUT,
-    UDP_BUFFER_SIZE, UDP_SENDQ_SIZE, UDP_TIMEOUT,
+    UDP_DATAGRAM_BUFFER_SIZE, UDP_SENDQ_BYTES, UDP_SENDQ_SIZE, UDP_TIMEOUT,
 };
 
 // The entrypoint of running a client
@@ -240,7 +241,7 @@ async fn run_data_channel<T: Transport>(
             ) {
                 bail!("Expect TCP traffic. Please check the configuration.")
             }
-            run_data_channel_for_tcp::<T>(conn, &args.service).await?;
+            run_data_channel_for_tcp::<T>(conn, &args.service, &mut session_closed).await?;
         }
         DataChannelCmd::StartForwardUdp => {
             if !matches!(
@@ -263,22 +264,93 @@ async fn run_data_channel<T: Transport>(
 async fn run_data_channel_for_tcp<T: Transport>(
     mut conn: T::Stream,
     service: &ClientServiceConfig,
+    session_closed: &mut broadcast::Receiver<()>,
 ) -> Result<()> {
-    debug!("New data channel starts forwarding");
-
-    let mut local = tcp_connect_local(
+    let connect = tcp_connect_local(
         service.local_addr.as_str(),
         service.local_addr_if.as_deref(),
-    )
-    .await
-    .with_context(|| {
-        format!(
-            "Failed to connect to {} for service {}",
-            service.local_addr, service.name
-        )
-    })?;
+    );
+    let Some(mut local) = connect_tcp_backend(connect, session_closed)
+        .await
+        .with_context(|| {
+            format!(
+                "Failed to connect to {} for service {}",
+                service.local_addr, service.name
+            )
+        })?
+    else {
+        return Ok(());
+    };
+    debug!("New data channel starts forwarding");
     let _ = copy_bidirectional(&mut conn, &mut local).await;
     Ok(())
+}
+
+async fn connect_tcp_backend<S>(
+    connect: impl Future<Output = Result<S>>,
+    session_closed: &mut broadcast::Receiver<()>,
+) -> Result<Option<S>> {
+    tokio::select! {
+        biased;
+        _ = session_closed.recv() => Ok(None),
+        result = time::timeout(NETWORK_IO_TIMEOUT, connect) => {
+            result.context("TCP backend connection timed out")?.map(Some)
+        }
+    }
+}
+
+struct QueuedDatagram {
+    packet: UdpTraffic,
+    _bytes: OwnedSemaphorePermit,
+}
+
+impl QueuedDatagram {
+    fn into_packet(self) -> UdpTraffic {
+        self.packet
+    }
+}
+
+struct DatagramSender {
+    sender: mpsc::Sender<QueuedDatagram>,
+    bytes: Arc<Semaphore>,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum DatagramSend {
+    Queued,
+    Full,
+    Closed,
+}
+
+impl DatagramSender {
+    fn channel(capacity: usize) -> (Self, mpsc::Receiver<QueuedDatagram>) {
+        let (sender, receiver) = mpsc::channel(capacity);
+        let bytes = Arc::new(Semaphore::new(UDP_SENDQ_BYTES));
+        (Self { sender, bytes }, receiver)
+    }
+
+    fn try_send(&self, packet: UdpTraffic) -> DatagramSend {
+        if self.sender.is_closed() {
+            return DatagramSend::Closed;
+        }
+        // Callers pass the length of a datagram decoded from a u16 or read into
+        // the UDP receive buffer.
+        let Ok(bytes) = self
+            .bytes
+            .clone()
+            .try_acquire_many_owned(packet.data.len() as u32)
+        else {
+            return DatagramSend::Full;
+        };
+        match self.sender.try_send(QueuedDatagram {
+            packet,
+            _bytes: bytes,
+        }) {
+            Ok(()) => DatagramSend::Queued,
+            Err(mpsc::error::TrySendError::Full(_)) => DatagramSend::Full,
+            Err(mpsc::error::TrySendError::Closed(_)) => DatagramSend::Closed,
+        }
+    }
 }
 
 // Each UDP visitor gets its own socket to the local service.
@@ -288,7 +360,9 @@ async fn run_data_channel_for_udp<T: Transport>(
     service: &ClientServiceConfig,
 ) -> Result<()> {
     debug!("New data channel starts forwarding");
-    let (outbound_tx, mut outbound_rx) = mpsc::channel::<UdpTraffic>(UDP_SENDQ_SIZE);
+    let (outbound_tx, mut outbound_rx) = DatagramSender::channel(UDP_SENDQ_SIZE);
+    let outbound_tx = Arc::new(outbound_tx);
+    let receive_buffer = Arc::new(Mutex::new(vec![0; UDP_DATAGRAM_BUFFER_SIZE]));
     let (mut rd, mut wr) = io::split(conn);
 
     let read = async {
@@ -327,23 +401,31 @@ async fn run_data_channel_for_udp<T: Transport>(
                             continue;
                         }
                     };
-                    let (tx, rx) = mpsc::channel(UDP_SENDQ_SIZE);
+                    let (tx, rx) = DatagramSender::channel(UDP_SENDQ_SIZE);
                     let outbound_tx = outbound_tx.clone();
+                    let receive_buffer = receive_buffer.clone();
                     forwarders.spawn(async move {
-                        let result = run_udp_forwarder(socket, rx, outbound_tx, packet.from).await;
+                        let result = run_udp_forwarder(
+                            socket,
+                            rx,
+                            &outbound_tx,
+                            &receive_buffer,
+                            packet.from,
+                        )
+                        .await;
                         (packet.from, result)
                     });
                     entry.insert(tx)
                 }
             };
             // Drop a datagram when this visitor's queue is full or has closed.
-            let _ = tx.try_send(packet.data);
+            tx.try_send(packet);
         }
     };
 
     let write = async {
         while let Some(packet) = outbound_rx.recv().await {
-            packet.write(&mut wr).await?;
+            packet.into_packet().write(&mut wr).await?;
         }
         Ok(())
     };
@@ -357,27 +439,24 @@ async fn run_data_channel_for_udp<T: Transport>(
 #[instrument(skip_all, fields(from))]
 async fn run_udp_forwarder(
     socket: UdpSocket,
-    mut inbound_rx: mpsc::Receiver<Bytes>,
-    outbound_tx: mpsc::Sender<UdpTraffic>,
+    mut inbound_rx: mpsc::Receiver<QueuedDatagram>,
+    outbound_tx: &DatagramSender,
+    receive_buffer: &Mutex<Vec<u8>>,
     from: SocketAddr,
 ) -> Result<()> {
-    let mut buf = [0; UDP_BUFFER_SIZE];
     loop {
         tokio::select! {
             data = inbound_rx.recv() => {
                 let Some(data) = data else { break };
+                let data = data.into_packet().data;
                 time::timeout(NETWORK_IO_TIMEOUT, socket.send(&data))
                     .await
                     .context("UDP backend send timed out")??;
             },
-            result = socket.recv(&mut buf) => {
-                let len = result?;
-                let packet = UdpTraffic {
-                    from,
-                    data: Bytes::copy_from_slice(&buf[..len]),
-                };
+            result = receive_udp_reply(&socket, receive_buffer) => {
+                let data = result?;
                 // UDP replies can be dropped under backpressure.
-                if let Err(mpsc::error::TrySendError::Closed(_)) = outbound_tx.try_send(packet) {
+                if outbound_tx.try_send(UdpTraffic { from, data }) == DatagramSend::Closed {
                     break;
                 }
             },
@@ -385,6 +464,19 @@ async fn run_udp_forwarder(
         }
     }
     Ok(())
+}
+
+async fn receive_udp_reply(socket: &UdpSocket, buffer: &Mutex<Vec<u8>>) -> io::Result<Bytes> {
+    loop {
+        socket.readable().await?;
+        // try_recv is synchronous. Never hold the shared buffer across an await.
+        let mut buffer = buffer.lock().unwrap();
+        match socket.try_recv(&mut buffer) {
+            Ok(len) => return Ok(Bytes::copy_from_slice(&buffer[..len])),
+            Err(error) if error.kind() == io::ErrorKind::WouldBlock => continue,
+            Err(error) => return Err(error),
+        }
+    }
 }
 
 // Control channel, using T as the transport layer

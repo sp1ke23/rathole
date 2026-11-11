@@ -1,10 +1,12 @@
 use backoff::ExponentialBackoff;
 use std::time::Duration;
 
-// FIXME: Determine reasonable size
-/// UDP MTU. Currently far larger than necessary
+/// Legacy UDP buffer size exported by the library.
 pub const UDP_BUFFER_SIZE: usize = 2048;
+pub const UDP_DATAGRAM_BUFFER_SIZE: usize = u16::MAX as usize;
 pub const UDP_SENDQ_SIZE: usize = 1024;
+#[cfg(feature = "client")]
+pub const UDP_SENDQ_BYTES: usize = 2 * 1024 * 1024;
 pub const UDP_TIMEOUT: u64 = 60;
 pub const NETWORK_IO_TIMEOUT: Duration = Duration::from_secs(5);
 #[cfg(feature = "client")]

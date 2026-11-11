@@ -1,4 +1,5 @@
 use core::result::Result;
+use std::future::Future;
 use std::io::{Error, ErrorKind};
 use std::net::SocketAddr;
 use std::pin::Pin;
@@ -6,6 +7,7 @@ use std::task::{ready, Context, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
+use crate::constants::NETWORK_IO_TIMEOUT;
 use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -13,6 +15,7 @@ use futures_core::stream::Stream;
 use futures_sink::Sink;
 use tokio::io::{AsyncBufRead, AsyncRead, AsyncWrite, ReadBuf};
 use tokio::net::{TcpListener, TcpStream, ToSocketAddrs};
+use tokio::time::{self, Sleep};
 use tokio_native_tls::TlsStream;
 use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 use tokio_tungstenite::{accept_async_with_config, client_async_with_config};
@@ -79,41 +82,97 @@ impl AsyncWrite for TransportStream {
 }
 
 #[derive(Debug)]
-struct StreamWrapper {
-    inner: WebSocketStream<TransportStream>,
+enum ReadState {
+    Reading,
+    Flushing {
+        close: bool,
+        deadline: Pin<Box<Sleep>>,
+    },
+    Closed,
 }
 
-impl Stream for StreamWrapper {
+#[derive(Debug)]
+struct StreamWrapper<S> {
+    inner: WebSocketStream<S>,
+    state: ReadState,
+}
+
+impl<S> StreamWrapper<S> {
+    fn new(inner: WebSocketStream<S>) -> Self {
+        Self {
+            inner,
+            state: ReadState::Reading,
+        }
+    }
+}
+
+impl<S: AsyncRead + AsyncWrite + Unpin> Stream for StreamWrapper<S> {
     type Item = Result<Bytes, Error>;
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
-        match Pin::new(&mut self.get_mut().inner).poll_next(cx) {
-            Poll::Pending => Poll::Pending,
-            Poll::Ready(None) => Poll::Ready(None),
-            Poll::Ready(Some(Err(err))) => {
-                Poll::Ready(Some(Err(Error::new(ErrorKind::Other, err))))
+        let stream = self.get_mut();
+        for _ in 0..16 {
+            match &mut stream.state {
+                ReadState::Reading => {}
+                ReadState::Flushing { close, deadline } => {
+                    let result = match Pin::new(&mut stream.inner).poll_flush(cx) {
+                        Poll::Ready(result) => {
+                            result.map_err(|error| Error::new(ErrorKind::Other, error))
+                        }
+                        Poll::Pending => {
+                            ready!(deadline.as_mut().poll(cx));
+                            let error = Error::new(
+                                ErrorKind::TimedOut,
+                                "WebSocket control frame flush timed out",
+                            );
+                            tracing::debug!("{error}");
+                            Err(error)
+                        }
+                    };
+                    if *close || result.is_err() {
+                        stream.state = ReadState::Closed;
+                        return Poll::Ready(result.err().map(Err));
+                    }
+                    stream.state = ReadState::Reading;
+                }
+                ReadState::Closed => return Poll::Ready(None),
             }
-            Poll::Ready(Some(Ok(res))) => {
-                if let Message::Binary(b) = res {
-                    Poll::Ready(Some(Ok(Bytes::from(b))))
-                } else {
-                    Poll::Ready(Some(Err(Error::new(
+
+            match ready!(Pin::new(&mut stream.inner).poll_next(cx)) {
+                Some(Ok(Message::Binary(data))) if !data.is_empty() => {
+                    return Poll::Ready(Some(Ok(Bytes::from(data))));
+                }
+                Some(Ok(Message::Pong(_) | Message::Binary(_))) => {}
+                Some(Ok(message @ (Message::Ping(_) | Message::Close(_)))) => {
+                    // tungstenite has already queued the reply. Flush it even
+                    // when the peer waits for the reply before sending more data.
+                    stream.state = ReadState::Flushing {
+                        close: message.is_close(),
+                        deadline: Box::pin(time::sleep(NETWORK_IO_TIMEOUT)),
+                    };
+                }
+                Some(Ok(_)) => {
+                    return Poll::Ready(Some(Err(Error::new(
                         ErrorKind::InvalidData,
                         "unexpected frame",
-                    ))))
+                    ))));
                 }
+                Some(Err(error)) => {
+                    return Poll::Ready(Some(Err(Error::new(ErrorKind::Other, error))))
+                }
+                None => return Poll::Ready(None),
             }
         }
-    }
 
-    fn size_hint(&self) -> (usize, Option<usize>) {
-        self.inner.size_hint()
+        // Buffered control frames can be ready without another socket poll.
+        cx.waker().wake_by_ref();
+        Poll::Pending
     }
 }
 
 #[derive(Debug)]
 pub struct WebsocketTunnel {
-    inner: StreamReader<StreamWrapper, Bytes>,
+    inner: StreamReader<StreamWrapper<TransportStream>, Bytes>,
 }
 
 impl AsyncRead for WebsocketTunnel {
@@ -227,7 +286,7 @@ impl Transport for WebsocketTransport {
         };
         let wsstream = accept_async_with_config(tsream, Some(self.conf)).await?;
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream }),
+            inner: StreamReader::new(StreamWrapper::new(wsstream)),
         };
         Ok(tun)
     }
@@ -243,8 +302,116 @@ impl Transport for WebsocketTransport {
             .await
             .context("Failed to do WebSocket handshake")?;
         let tun = WebsocketTunnel {
-            inner: StreamReader::new(StreamWrapper { inner: wsstream }),
+            inner: StreamReader::new(StreamWrapper::new(wsstream)),
         };
         Ok(tun)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::poll_fn;
+    use tokio::io::{self, AsyncReadExt, AsyncWriteExt};
+    use tokio::time::{self, Duration};
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    async fn send<S: AsyncRead + AsyncWrite + Unpin>(
+        stream: &mut WebSocketStream<S>,
+        message: Message,
+    ) -> anyhow::Result<()> {
+        poll_fn(|cx| Pin::new(&mut *stream).poll_ready(cx)).await?;
+        Pin::new(&mut *stream).start_send(message)?;
+        poll_fn(|cx| Pin::new(&mut *stream).poll_flush(cx)).await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn ping_receives_pong_before_the_next_binary_frame() -> anyhow::Result<()> {
+        time::timeout(Duration::from_secs(3), async {
+            let listener = TcpListener::bind("127.0.0.1:0").await?;
+            let addr = AddrMaybeCached::new(&listener.local_addr()?.to_string());
+            let transport = WebsocketTransport::new(&TransportConfig {
+                websocket: Some(crate::config::WebsocketConfig { tls: false }),
+                ..TransportConfig::default()
+            })?;
+            let peer = async {
+                let (socket, _) = listener.accept().await?;
+                let mut ws = tokio_tungstenite::accept_async(socket).await?;
+                let payload = b"keepalive".to_vec();
+                send(&mut ws, Message::Ping(payload.clone())).await?;
+                let pong = poll_fn(|cx| Pin::new(&mut ws).poll_next(cx))
+                    .await
+                    .transpose()?;
+                assert_eq!(pong, Some(Message::Pong(payload)));
+                send(&mut ws, Message::Binary(b"payload".to_vec())).await?;
+                send(&mut ws, Message::Pong(b"unsolicited".to_vec())).await?;
+                send(&mut ws, Message::Binary(b" again".to_vec())).await?;
+                send(&mut ws, Message::Close(None)).await?;
+                let close = poll_fn(|cx| Pin::new(&mut ws).poll_next(cx))
+                    .await
+                    .transpose()?;
+                assert_eq!(close, Some(Message::Close(None)));
+                Ok::<_, anyhow::Error>(())
+            };
+            let tunnel = async {
+                let mut stream = transport.connect(&addr).await?;
+                let mut data = Vec::new();
+                stream.read_to_end(&mut data).await?;
+                assert_eq!(data, b"payload again");
+                Ok(())
+            };
+            tokio::try_join!(peer, tunnel)?;
+            Ok(())
+        })
+        .await
+        .context("WebSocket control exchange stalled")?
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn blocked_pong_flush_has_a_deadline() -> anyhow::Result<()> {
+        let (socket, peer) = io::duplex(32);
+        let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+        let mut tunnel = StreamWrapper::new(ws);
+        let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+        tunnel.inner.get_mut().write_all(&[0; 32]).await?;
+        send(&mut peer, Message::Ping(b"ping".to_vec())).await?;
+        let start = time::Instant::now();
+        let result = time::timeout(
+            NETWORK_IO_TIMEOUT * 2,
+            poll_fn(|cx| Pin::new(&mut tunnel).poll_next(cx)),
+        )
+        .await?;
+        assert_eq!(result.unwrap().unwrap_err().kind(), ErrorKind::TimedOut);
+        assert!(start.elapsed() >= NETWORK_IO_TIMEOUT);
+        assert!(poll_fn(|cx| Pin::new(&mut tunnel).poll_next(cx))
+            .await
+            .is_none());
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn control_frame_burst_yields_before_reading_binary() -> anyhow::Result<()> {
+        time::timeout(Duration::from_secs(1), async {
+            let (socket, peer) = io::duplex(4096);
+            let ws = WebSocketStream::from_raw_socket(socket, Role::Server, None).await;
+            let mut tunnel = StreamWrapper::new(ws);
+            let mut peer = WebSocketStream::from_raw_socket(peer, Role::Client, None).await;
+            for _ in 0..64 {
+                send(&mut peer, Message::Pong(Vec::new())).await?;
+            }
+            send(&mut peer, Message::Binary(b"data".to_vec())).await?;
+            let first_poll = poll_fn(|cx| Poll::Ready(Pin::new(&mut tunnel).poll_next(cx))).await;
+            assert!(first_poll.is_pending());
+
+            let other_task = tokio::spawn(async { "scheduled" });
+            let data = poll_fn(|cx| Pin::new(&mut tunnel).poll_next(cx))
+                .await
+                .unwrap()?;
+            assert_eq!(data, b"data"[..]);
+            assert_eq!(other_task.await?, "scheduled");
+            Ok(())
+        })
+        .await?
     }
 }

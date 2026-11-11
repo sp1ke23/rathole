@@ -87,7 +87,8 @@ impl UdpTraffic {
     ) -> Result<()> {
         let hdr = UdpHeader {
             from,
-            len: data.len() as UdpPacketLen,
+            len: UdpPacketLen::try_from(data.len())
+                .context("UDP datagram exceeds the frame length limit")?,
         };
 
         let v = bincode::serialize(&hdr).unwrap();
@@ -254,6 +255,27 @@ mod tests {
     use super::*;
     use tokio::io::duplex;
     use tokio::time::Instant;
+
+    #[tokio::test]
+    async fn udp_frame_length_is_checked_before_writing() -> Result<()> {
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let mut payload = vec![42; u16::MAX as usize];
+        let mut frame = Vec::new();
+        UdpTraffic::write_slice(&mut frame, addr, &payload).await?;
+        let mut reader = frame.as_slice();
+        let len = reader.read_u8().await?;
+        let packet = UdpTraffic::read(&mut reader, len).await?;
+        assert_eq!(packet.data.as_ref(), payload);
+        assert!(reader.is_empty());
+
+        frame.clear();
+        payload.push(42);
+        assert!(UdpTraffic::write_slice(&mut frame, addr, &payload)
+            .await
+            .is_err());
+        assert!(frame.is_empty());
+        Ok(())
+    }
 
     #[tokio::test(start_paused = true)]
     async fn prewarmed_channel_only_times_out_after_command_starts() -> Result<()> {

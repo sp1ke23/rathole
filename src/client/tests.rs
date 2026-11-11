@@ -230,35 +230,207 @@ async fn read_http_request(stream: &mut tokio::net::TcpStream) -> Result<()> {
     Ok(())
 }
 
+#[cfg(target_os = "linux")]
+#[tokio::test]
+async fn stalled_backend_dial_times_out_and_hot_reload_cancels_it() -> Result<()> {
+    time::timeout(NETWORK_IO_TIMEOUT + Duration::from_secs(3), async {
+        tokio::try_join!(
+            exercise_stalled_backend(false),
+            exercise_stalled_backend(true)
+        )?;
+        Ok(())
+    })
+    .await
+    .context("Stalled TCP backend did not release its tunnel")?
+}
+
+#[cfg(target_os = "linux")]
+async fn exercise_stalled_backend(reload: bool) -> Result<()> {
+    use tokio::net::{TcpSocket, TcpStream};
+
+    let socket = TcpSocket::new_v4()?;
+    socket.bind(LOOPBACK.parse()?)?;
+    let backend = socket.listen(1)?;
+    let backend_addr = backend.local_addr()?;
+    let first = TcpStream::connect(backend_addr).await?;
+    let second = TcpStream::connect(backend_addr).await?;
+    let probe = time::timeout(Duration::from_millis(100), TcpStream::connect(backend_addr));
+    assert!(probe.await.is_err(), "backend listen queue is not full");
+
+    let listener = TcpListener::bind(LOOPBACK).await?;
+    let mut config = client_config(&listener)?;
+    config.heartbeat_timeout = 0;
+    config.services.get_mut(SERVICE).unwrap().local_addr = backend_addr.to_string();
+    let (shutdown, shutdown_rx) = broadcast::channel(1);
+    let (updates, update_rx) = mpsc::channel(1);
+    let client = tokio::spawn(run_client(
+        Config {
+            client: Some(config),
+            server: None,
+        },
+        shutdown_rx,
+        update_rx,
+    ));
+    let (mut control, _) = listener.accept().await?;
+    answer_control_hello(&mut control).await?;
+    control.write_all(&bincode::serialize(&Ack::Ok)?).await?;
+    let mut data = request_tcp_tunnel(&listener, &mut control).await?;
+
+    let stalled = time::timeout(Duration::from_millis(100), data.read(&mut [0])).await;
+    assert!(
+        stalled.is_err(),
+        "data channel closed before the backend dial could stall"
+    );
+    let delete = ConfigChange::ClientChange(ClientServiceChange::Delete(SERVICE.into()));
+    if reload {
+        updates.send(delete).await?;
+        assert_eq!(
+            time::timeout(Duration::from_secs(1), data.read(&mut [0])).await??,
+            0
+        );
+    } else {
+        assert_eq!(data.read(&mut [0]).await?, 0);
+        // Drain the original connections, then use the existing control session to forward again.
+        drop((first, second));
+        for _ in 0..2 {
+            drop(backend.accept().await?);
+        }
+        let mut data = request_tcp_tunnel(&listener, &mut control).await?;
+        let (mut local, _) = backend.accept().await?;
+        data.write_all(b"ping").await?;
+        let mut payload = [0; 4];
+        local.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"ping");
+        updates.send(delete).await?;
+        assert_eq!(control.read(&mut [0]).await?, 0);
+        local.write_all(b"pong").await?;
+        data.read_exact(&mut payload).await?;
+        assert_eq!(&payload, b"pong");
+    }
+    shutdown.send(true)?;
+    client.await??;
+    Ok(())
+}
+
+#[cfg(target_os = "linux")]
+async fn request_tcp_tunnel(
+    listener: &TcpListener,
+    control: &mut tokio::net::TcpStream,
+) -> Result<tokio::net::TcpStream> {
+    control
+        .write_all(&bincode::serialize(&ControlChannelCmd::CreateDataChannel)?)
+        .await?;
+    let (mut data, _) = listener.accept().await?;
+    assert!(matches!(read_hello(&mut data).await?, DataChannelHello(..)));
+    data.write_all(&bincode::serialize(&DataChannelCmd::StartForwardTcp)?)
+        .await?;
+    Ok(data)
+}
+
+#[tokio::test(start_paused = true)]
+async fn backend_dial_deadline_and_session_cancellation() -> Result<()> {
+    use std::future::pending;
+
+    let (session, mut closed) = broadcast::channel(1);
+    let start = Instant::now();
+    let err = connect_tcp_backend(pending::<Result<()>>(), &mut closed)
+        .await
+        .unwrap_err();
+    assert_eq!(err.to_string(), "TCP backend connection timed out");
+    assert!(start.elapsed() >= NETWORK_IO_TIMEOUT);
+
+    let start = Instant::now();
+    let (result, ()) = tokio::join!(
+        connect_tcp_backend(pending::<Result<()>>(), &mut closed),
+        async {
+            time::sleep(Duration::from_secs(1)).await;
+            drop(session);
+        }
+    );
+    assert!(result?.is_none());
+    assert!(start.elapsed() < NETWORK_IO_TIMEOUT);
+    // Shutdown wins even if the backend becomes ready in the same poll.
+    assert!(connect_tcp_backend(async { Ok(()) }, &mut closed)
+        .await?
+        .is_none());
+    Ok(())
+}
+
+#[tokio::test]
+async fn udp_queue_releases_its_byte_budget_on_dequeue_and_close() {
+    let (sender, mut receiver) = DatagramSender::channel(UDP_SENDQ_SIZE);
+    let payload = Bytes::from(vec![5; UDP_DATAGRAM_BUFFER_SIZE]);
+    let packet = || UdpTraffic {
+        from: SocketAddr::from(([127, 0, 0, 1], 1234)),
+        data: payload.clone(),
+    };
+    for _ in 0..UDP_SENDQ_BYTES / payload.len() {
+        assert_eq!(sender.try_send(packet()), DatagramSend::Queued);
+    }
+    assert_eq!(sender.try_send(packet()), DatagramSend::Full);
+    let dequeued = receiver.try_recv().unwrap().into_packet();
+    assert_eq!(dequeued.data, payload);
+    assert_eq!(sender.try_send(packet()), DatagramSend::Queued);
+    drop(receiver);
+    assert_eq!(sender.bytes.available_permits(), UDP_SENDQ_BYTES);
+    assert_eq!(sender.try_send(packet()), DatagramSend::Closed);
+}
+
 #[tokio::test]
 async fn full_udp_reply_queue_does_not_block_the_visitor() -> Result<()> {
     time::timeout(Duration::from_secs(2), async {
-        let backend = UdpSocket::bind(LOOPBACK).await?;
-        let visitor = UdpSocket::bind(LOOPBACK).await?;
-        visitor.connect(backend.local_addr()?).await?;
-        let from = visitor.local_addr()?;
-        let (inbound_tx, inbound_rx) = mpsc::channel(1);
-        let (outbound_tx, mut outbound_rx) = mpsc::channel(1);
-        outbound_tx.try_send(UdpTraffic {
-            from,
-            data: Bytes::from_static(b"queued"),
-        })?;
-        let forwarder = tokio::spawn(run_udp_forwarder(visitor, inbound_rx, outbound_tx, from));
-        for _ in 0..8 {
-            backend.send_to(b"drop under backpressure", from).await?;
-            tokio::task::yield_now().await;
-        }
-
-        inbound_tx.send(Bytes::from_static(b"visitor data")).await?;
-        let mut buf = [0; 64];
-        let (len, _) = backend.recv_from(&mut buf).await?;
-        assert_eq!(&buf[..len], b"visitor data");
-        drop(inbound_tx);
-        forwarder.await??;
-        assert_eq!(outbound_rx.recv().await.unwrap().data, b"queued"[..]);
-        assert!(outbound_rx.recv().await.is_none());
+        tokio::try_join!(
+            exercise_full_udp_reply_queue(1, 6),
+            exercise_full_udp_reply_queue(UDP_SENDQ_SIZE, UDP_DATAGRAM_BUFFER_SIZE),
+        )?;
         Ok(())
     })
     .await
     .context("UDP visitor was blocked by a full reply queue")?
+}
+
+async fn exercise_full_udp_reply_queue(capacity: usize, queued_len: usize) -> Result<()> {
+    let backend = UdpSocket::bind(LOOPBACK).await?;
+    let visitor = UdpSocket::bind(LOOPBACK).await?;
+    visitor.connect(backend.local_addr()?).await?;
+    let from = visitor.local_addr()?;
+    let (inbound_tx, inbound_rx) = DatagramSender::channel(1);
+    let (outbound_tx, mut outbound_rx) = DatagramSender::channel(capacity);
+    let queued = Bytes::from(vec![3; queued_len]);
+    let queued_count = capacity.min(UDP_SENDQ_BYTES / queued_len);
+    for _ in 0..queued_count {
+        assert_eq!(
+            outbound_tx.try_send(UdpTraffic {
+                from,
+                data: queued.clone(),
+            }),
+            DatagramSend::Queued,
+        );
+    }
+    let forwarder = tokio::spawn(async move {
+        let buffer = Mutex::new(vec![0; UDP_DATAGRAM_BUFFER_SIZE]);
+        run_udp_forwarder(visitor, inbound_rx, &outbound_tx, &buffer, from).await
+    });
+    for _ in 0..8 {
+        backend.send_to(&[7; 64], from).await?;
+        tokio::task::yield_now().await;
+    }
+
+    assert_eq!(
+        inbound_tx.try_send(UdpTraffic {
+            from,
+            data: Bytes::from_static(b"visitor data"),
+        }),
+        DatagramSend::Queued
+    );
+    let mut buf = [0; 64];
+    let (len, _) = backend.recv_from(&mut buf).await?;
+    assert_eq!(&buf[..len], b"visitor data");
+    drop(inbound_tx);
+    forwarder.await??;
+    for _ in 0..queued_count {
+        assert_eq!(outbound_rx.recv().await.unwrap().into_packet().data, queued,);
+    }
+    assert!(outbound_rx.recv().await.is_none());
+    Ok(())
 }
