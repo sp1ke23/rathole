@@ -1,6 +1,323 @@
 use super::*;
+use crate::config::MaskedString;
+use std::net::SocketAddr;
 
 const LOOPBACK: &str = "127.0.0.1:0";
+const SERVICE: &str = "backend";
+const TOKEN: &str = "test-token";
+
+#[tokio::test]
+async fn retries_missing_data_channels_for_tcp_and_udp() -> Result<()> {
+    time::timeout(DATA_REQUEST_RETRY * 2 + Duration::from_secs(5), async {
+        tokio::try_join!(
+            recover_missing_channels(ServiceType::Tcp),
+            recover_missing_channels(ServiceType::Udp),
+            recover_missing_channels(ServiceType::TcpAndUdp),
+        )?;
+        Ok(())
+    })
+    .await
+    .context("Data forwarding did not recover after requests were dropped")?
+}
+
+async fn recover_missing_channels(service_type: ServiceType) -> Result<()> {
+    let has_tcp = matches!(service_type, ServiceType::Tcp | ServiceType::TcpAndUdp);
+    let has_udp = matches!(service_type, ServiceType::Udp | ServiceType::TcpAndUdp);
+    let (reserved_tcp, reserved_udp) = bind_ephemeral_tcp_and_udp().await?;
+    let exposed = reserved_tcp.local_addr()?;
+    drop((reserved_tcp, reserved_udp));
+
+    let listener = TcpListener::bind(LOOPBACK).await?;
+    let (mut control, stream) = open_tcp_pair(&listener).await?;
+    let handle = ControlChannelHandle::<TcpTransport>::new(
+        stream,
+        ServerServiceConfig {
+            service_type,
+            bind_addr: exposed.to_string(),
+            ..ServerServiceConfig::with_name("backend")
+        },
+        0,
+    );
+    for _ in 0..(usize::from(has_tcp) * TCP_POOL_SIZE + usize::from(has_udp) * UDP_POOL_SIZE) {
+        expect_data_request(&mut control).await?;
+    }
+
+    let mut tcp = if has_tcp {
+        let mut visitor = connect_when_listening(exposed).await?;
+        visitor.write_all(b"tcp").await?;
+        expect_data_request(&mut control).await?;
+        Some(visitor)
+    } else {
+        None
+    };
+    let mut udp = if has_udp {
+        let visitor = UdpSocket::bind(LOOPBACK).await?;
+        visitor.connect(exposed).await?;
+        Some(visitor)
+    } else {
+        None
+    };
+
+    // Ignore the first timed replacement too. The second must arrive on the same session.
+    expect_data_request(&mut control).await?;
+    expect_data_request(&mut control).await?;
+
+    for _ in 0..(usize::from(has_tcp) + usize::from(has_udp)) {
+        let (mut peer, stream) = open_tcp_pair(&listener).await?;
+        handle.data_ch_tx.send(stream).await?;
+        match protocol::read_data_cmd(&mut peer).await? {
+            DataChannelCmd::StartForwardTcp => {
+                let mut visitor = tcp.take().context("Unexpected TCP data channel")?;
+                let mut payload = [0; 3];
+                peer.read_exact(&mut payload).await?;
+                assert_eq!(&payload, b"tcp");
+                peer.write_all(&payload).await?;
+                visitor.read_exact(&mut payload).await?;
+                assert_eq!(&payload, b"tcp");
+            }
+            DataChannelCmd::StartForwardUdp => {
+                let visitor = udp.take().context("Unexpected UDP data channel")?;
+                visitor.send(b"udp").await?;
+                let len = peer.read_u8().await?;
+                let packet = UdpTraffic::read(&mut peer, len).await?;
+                assert_eq!(packet.data.as_ref(), b"udp");
+                packet.write(&mut peer).await?;
+                let mut reply = [0; 4];
+                let len = visitor.recv(&mut reply).await?;
+                assert_eq!(&reply[..len], b"udp");
+            }
+        }
+    }
+    assert!(tcp.is_none() && udp.is_none());
+    Ok(())
+}
+
+async fn expect_data_request(stream: &mut TcpStream) -> Result<()> {
+    let command = protocol::read_control_cmd(stream).await?;
+    assert!(matches!(command, ControlChannelCmd::CreateDataChannel));
+    Ok(())
+}
+
+async fn connect_when_listening(addr: SocketAddr) -> io::Result<TcpStream> {
+    loop {
+        match TcpStream::connect(addr).await {
+            Err(error) if error.kind() == io::ErrorKind::ConnectionRefused => {
+                time::sleep(Duration::from_millis(10)).await;
+            }
+            result => return result,
+        }
+    }
+}
+
+#[tokio::test]
+async fn expires_a_waiting_tcp_visitor_and_serves_the_next_one() -> Result<()> {
+    time::timeout(TCP_VISITOR_TIMEOUT + Duration::from_secs(5), async {
+        let listener = TcpListener::bind(LOOPBACK).await?;
+        let exposed = listener.local_addr()?;
+        let (data_tx, data_rx) = mpsc::channel(TCP_POOL_SIZE);
+        let (requests, mut commands) = mpsc::channel(TCP_POOL_SIZE);
+        let pool = tokio::spawn(async move {
+            run_tcp_connection_pool::<TcpTransport>(listener, &Mutex::new(data_rx), &requests).await
+        });
+
+        let mut stalled = TcpStream::connect(exposed).await?;
+        commands
+            .recv()
+            .await
+            .context("Expected initial TCP request")?;
+        assert_eq!(stalled.read(&mut [0]).await?, 0);
+
+        let mut next = TcpStream::connect(exposed).await?;
+        let tunnel = TcpListener::bind(LOOPBACK).await?;
+        let (mut peer, stream) = open_tcp_pair(&tunnel).await?;
+        data_tx.send(stream).await?;
+        assert!(matches!(
+            protocol::read_data_cmd(&mut peer).await?,
+            DataChannelCmd::StartForwardTcp
+        ));
+        peer.write_all(b"ok").await?;
+        let mut reply = [0; 2];
+        next.read_exact(&mut reply).await?;
+        assert_eq!(&reply, b"ok");
+        pool.abort();
+        Ok(())
+    })
+    .await
+    .context("TCP visitor deadline or subsequent connection failed")?
+}
+
+#[tokio::test]
+async fn full_channel_pool_discards_late_arrivals() -> Result<()> {
+    time::timeout(Duration::from_secs(5), async {
+        let listener = TcpListener::bind(LOOPBACK).await?;
+        let (_control, stream) = open_tcp_pair(&listener).await?;
+        let handle = ControlChannelHandle::<TcpTransport>::new(
+            stream,
+            ServerServiceConfig {
+                bind_addr: LOOPBACK.to_string(),
+                ..ServerServiceConfig::with_name("backend")
+            },
+            0,
+        );
+        let nonce = [1; HASH_WIDTH_IN_BYTES];
+        let mut channels = ControlChannelMap::new();
+        let _ = channels.insert([2; HASH_WIDTH_IN_BYTES], nonce, handle);
+        let channels = Arc::new(RwLock::new(channels));
+        let mut parked = Vec::new();
+        for _ in 0..TCP_POOL_SIZE {
+            let (peer, stream) = open_tcp_pair(&listener).await?;
+            do_data_channel_handshake(stream, channels.clone(), nonce).await?;
+            parked.push(peer);
+        }
+        let (mut extra, stream) = open_tcp_pair(&listener).await?;
+        do_data_channel_handshake(stream, channels.clone(), nonce).await?;
+        assert_eq!(extra.read(&mut [0]).await?, 0);
+        Ok(())
+    })
+    .await
+    .context("Server did not discard a late tunnel for a full pool")?
+}
+
+#[tokio::test(start_paused = true)]
+async fn times_out_writing_a_control_or_start_command() {
+    let (mut writer, _blocked_peer) = io::duplex(1);
+    let error = write_command(&mut writer, &[0; 4]).await.unwrap_err();
+    assert_eq!(error.to_string(), "Command write timed out");
+}
+
+#[tokio::test(start_paused = true)]
+async fn blocked_tcp_start_requests_a_replacement() -> Result<()> {
+    let (data_tx, data_rx) = mpsc::channel(1);
+    let (requests, mut commands) = mpsc::channel(1);
+    let (blocked, _blocked_peer) = io::duplex(1);
+    data_tx.send(blocked).await?;
+    let pool = Mutex::new(data_rx);
+    let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp)?;
+    let (_, observed) = time::timeout(NETWORK_IO_TIMEOUT * 2, async {
+        tokio::try_join!(start_tcp_forward(&pool, &requests, &cmd), async {
+            commands
+                .recv()
+                .await
+                .context("Expected a request after the blocked StartForward")?;
+            let (stream, mut peer) = io::duplex(8);
+            data_tx.send(stream).await?;
+            protocol::read_data_cmd(&mut peer).await
+        })
+    })
+    .await??;
+    assert!(matches!(observed, DataChannelCmd::StartForwardTcp));
+    Ok(())
+}
+
+async fn server_config() -> Result<(ServerConfig, SocketAddr)> {
+    let reservation = TcpListener::bind(LOOPBACK).await?;
+    let addr = reservation.local_addr()?;
+    Ok((
+        ServerConfig {
+            bind_addr: addr.to_string(),
+            services: HashMap::from([(
+                SERVICE.into(),
+                ServerServiceConfig {
+                    bind_addr: LOOPBACK.to_string(),
+                    token: Some(MaskedString::from(TOKEN)),
+                    ..ServerServiceConfig::with_name(SERVICE)
+                },
+            )]),
+            ..ServerConfig::default()
+        },
+        addr,
+    ))
+}
+
+async fn request_nonce<S: io::AsyncRead + io::AsyncWrite + Unpin>(conn: &mut S) -> Result<Nonce> {
+    let hello = ControlChannelHello(
+        protocol::CURRENT_PROTO_VERSION,
+        protocol::digest(SERVICE.as_bytes()),
+    );
+    conn.write_all(&bincode::serialize(&hello)?).await?;
+    conn.flush().await?;
+    match read_hello(conn).await? {
+        ControlChannelHello(_, nonce) => Ok(nonce),
+        _ => bail!("Expected control Hello"),
+    }
+}
+
+async fn authenticate<S: io::AsyncRead + io::AsyncWrite + Unpin>(conn: &mut S) -> Result<()> {
+    let nonce = request_nonce(conn).await?;
+    let auth = protocol::Auth(protocol::digest(&[TOKEN.as_bytes(), &nonce].concat()));
+    conn.write_all(&bincode::serialize(&auth)?).await?;
+    conn.flush().await?;
+    assert!(matches!(protocol::read_ack(conn).await?, Ack::Ok));
+    assert!(matches!(
+        protocol::read_control_cmd(conn).await?,
+        ControlChannelCmd::CreateDataChannel
+    ));
+    Ok(())
+}
+
+#[tokio::test]
+async fn closes_partial_hello_and_auth_while_accepting_valid_clients() -> Result<()> {
+    time::timeout(NETWORK_IO_TIMEOUT + Duration::from_secs(4), async {
+        let (config, addr) = server_config().await?;
+        let mut server = Server::<TcpTransport>::from(config).await?;
+        let (shutdown, shutdown_rx) = broadcast::channel(1);
+        let (_updates, update_rx) = mpsc::channel(1);
+        let server = tokio::spawn(async move { server.run(shutdown_rx, update_rx).await });
+
+        let mut stalled_hello = connect_when_listening(addr).await?;
+        stalled_hello.write_u8(0).await?;
+        let mut stalled_auth = TcpStream::connect(addr).await?;
+        request_nonce(&mut stalled_auth).await?;
+        stalled_auth.write_u8(0).await?;
+
+        let mut valid = TcpStream::connect(addr).await?;
+        time::timeout(Duration::from_secs(2), authenticate(&mut valid)).await??;
+        assert_eq!(stalled_hello.read(&mut [0]).await?, 0);
+        assert_eq!(stalled_auth.read(&mut [0]).await?, 0);
+
+        let mut pending = TcpStream::connect(addr).await?;
+        request_nonce(&mut pending).await?;
+        shutdown.send(true)?;
+        time::timeout(Duration::from_secs(2), async {
+            assert_eq!(pending.read(&mut [0]).await?, 0);
+            server.await??;
+            Ok::<_, anyhow::Error>(())
+        })
+        .await??;
+        Ok(())
+    })
+    .await
+    .context("Server failed to bound incomplete application handshakes")?
+}
+
+#[cfg(feature = "websocket")]
+#[tokio::test]
+async fn silent_websocket_handshake_does_not_block_another_connection() -> Result<()> {
+    time::timeout(NETWORK_IO_TIMEOUT + Duration::from_secs(4), async {
+        let (mut config, addr) = server_config().await?;
+        config.transport.transport_type = TransportType::Websocket;
+        config.transport.websocket = Some(crate::config::WebsocketConfig { tls: false });
+        let transport = WebsocketTransport::new(&config.transport)?;
+        let mut server = Server::<WebsocketTransport>::from(config).await?;
+        let (shutdown, shutdown_rx) = broadcast::channel(1);
+        let (_updates, update_rx) = mpsc::channel(1);
+        let server = tokio::spawn(async move { server.run(shutdown_rx, update_rx).await });
+
+        let mut stalled = connect_when_listening(addr).await?;
+        time::timeout(Duration::from_secs(2), async {
+            let address = crate::transport::AddrMaybeCached::new(&addr.to_string());
+            let mut conn = transport.connect(&address).await?;
+            authenticate(&mut conn).await
+        })
+        .await??;
+        assert_eq!(stalled.read(&mut [0]).await?, 0);
+        shutdown.send(true)?;
+        server.await??;
+        Ok(())
+    })
+    .await
+    .context("A silent WebSocket handshake blocked the listener")?
+}
 
 async fn bind_ephemeral_tcp_and_udp() -> io::Result<(TcpListener, UdpSocket)> {
     // A port assigned to TCP may already be in use by UDP.
@@ -67,10 +384,17 @@ async fn dual_service_requests_fresh_udp_channel_after_prewarm_is_drained() -> R
         for (index, mut peer) in prewarmed_peers.into_iter().enumerate() {
             let command = protocol::read_data_cmd(&mut peer).await?;
             assert!(matches!(command, DataChannelCmd::StartForwardUdp));
-            drop(peer);
+            let replacement_timeout = if index == 0 {
+                // Start a frame without completing it, and keep the connection open.
+                peer.write_u8(16).await?;
+                NETWORK_IO_TIMEOUT + Duration::from_secs(3)
+            } else {
+                drop(peer);
+                Duration::from_secs(3)
+            };
 
             let command = time::timeout(
-                Duration::from_secs(3),
+                replacement_timeout,
                 protocol::read_control_cmd(&mut control_peer),
             )
             .await
@@ -115,12 +439,10 @@ async fn open_tcp_pair(listener: &TcpListener) -> io::Result<(TcpStream, TcpStre
 #[cfg(feature = "client")]
 mod forwarding {
     use super::*;
-    use crate::config::{ClientConfig, ClientServiceConfig, MaskedString};
+    use crate::config::{ClientConfig, ClientServiceConfig};
     use crate::protocol::read_data_cmd;
-    use std::net::SocketAddr;
     use tokio::sync::oneshot;
 
-    const SERVICE: &str = "backend";
     const RETRY_DELAY: Duration = Duration::from_millis(20);
 
     #[tokio::test]
@@ -161,7 +483,7 @@ mod forwarding {
         let (udp_tunnels_tx, mut udp_tunnels) = mpsc::unbounded_channel();
         tokio::spawn(proxy_tunnels(proxy, control_addr, udp_tunnels_tx));
 
-        let token = MaskedString::from("test-token");
+        let token = MaskedString::from(TOKEN);
         let server_config = Config {
             server: Some(ServerConfig {
                 bind_addr: control_addr.to_string(),

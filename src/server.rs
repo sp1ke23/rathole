@@ -1,6 +1,6 @@
 use crate::config::{Config, ServerConfig, ServerServiceConfig, ServiceType, TransportType};
 use crate::config_watcher::{ConfigChange, ServerServiceChange};
-use crate::constants::{listen_backoff, UDP_BUFFER_SIZE};
+use crate::constants::{listen_backoff, DATA_REQUEST_RETRY, NETWORK_IO_TIMEOUT, UDP_BUFFER_SIZE};
 use crate::helper::retry_notify_with_deadline;
 use crate::multi_map::MultiMap;
 use crate::protocol::Hello::{ControlChannelHello, DataChannelHello};
@@ -20,7 +20,8 @@ use std::time::Duration;
 use tokio::io::{self, copy_bidirectional, AsyncReadExt, AsyncWriteExt};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{broadcast, mpsc, Mutex, RwLock};
-use tokio::time;
+use tokio::task::JoinSet;
+use tokio::time::{self, Instant};
 use tracing::{debug, error, info, info_span, instrument, warn, Instrument, Span};
 
 #[cfg(feature = "noise")]
@@ -33,10 +34,11 @@ use crate::transport::WebsocketTransport;
 type ServiceDigest = protocol::Digest; // SHA256 of a service name
 type Nonce = protocol::Digest; // Also called `session_key`
 
-const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP servies
+const TCP_POOL_SIZE: usize = 8; // The number of cached connections for TCP services
 const UDP_POOL_SIZE: usize = 2; // The number of cached connections for UDP services
-const CHAN_SIZE: usize = 2048; // The capacity of various chans
-const HANDSHAKE_TIMEOUT: u64 = 5; // Timeout for transport handshake
+const VISITOR_QUEUE_SIZE: usize = 2048;
+const MAX_PENDING_HANDSHAKES: usize = 128;
+const TCP_VISITOR_TIMEOUT: Duration = Duration::from_secs(30);
 
 // The entrypoint of running a server
 pub async fn run_server(
@@ -152,11 +154,13 @@ impl<T: 'static + Transport> Server<T> {
             ..Default::default()
         };
 
+        let mut handshakes = JoinSet::new();
+
         // Wait for connections and shutdown signals
         loop {
             tokio::select! {
                 // Wait for incoming control and data channels
-                ret = self.transport.accept(&l) => {
+                ret = self.transport.accept(&l), if handshakes.len() < MAX_PENDING_HANDSHAKES => {
                     match ret {
                         Err(err) => {
                             // Detects whether it's an IO error
@@ -179,28 +183,27 @@ impl<T: 'static + Transport> Server<T> {
                         Ok((conn, addr)) => {
                             backoff.reset();
 
-                            // Do transport handshake with a timeout
-                            match time::timeout(Duration::from_secs(HANDSHAKE_TIMEOUT), self.transport.handshake(conn)).await {
-                                Ok(conn) => {
-                                    match conn.with_context(|| "Failed to do transport handshake") {
-                                        Ok(conn) => {
-                                            let services = self.services.clone();
-                                            let control_channels = self.control_channels.clone();
-                                            let server_config = self.config.clone();
-                                            tokio::spawn(async move {
-                                                if let Err(err) = handle_connection(conn, services, control_channels, server_config).await {
-                                                    error!("{:#}", err);
-                                                }
-                                            }.instrument(info_span!("connection", %addr)));
-                                        }, Err(e) => {
-                                            error!("{:#}", e);
-                                        }
-                                    }
-                                },
-                                Err(e) => {
-                                    error!("Transport handshake timeout: {}", e);
+                            let transport = self.transport.clone();
+                            let services = self.services.clone();
+                            let control_channels = self.control_channels.clone();
+                            let server_config = self.config.clone();
+                            handshakes.spawn(async move {
+                                let result = async {
+                                    let conn = time::timeout(NETWORK_IO_TIMEOUT, transport.handshake(conn))
+                                        .await
+                                        .context("Transport handshake timed out")?
+                                        .context("Failed to do transport handshake")?;
+                                    time::timeout(
+                                        NETWORK_IO_TIMEOUT,
+                                        handle_connection(conn, services, control_channels, server_config),
+                                    )
+                                    .await
+                                    .context("Rathole handshake timed out")?
+                                }.await;
+                                if let Err(err) = result {
+                                    error!("{:#}", err);
                                 }
-                            }
+                            }.instrument(info_span!("connection", %addr)));
                         }
                     }
                 },
@@ -209,14 +212,18 @@ impl<T: 'static + Transport> Server<T> {
                     info!("Shuting down gracefully...");
                     break;
                 },
-                e = update_rx.recv() => {
-                    if let Some(e) = e {
-                        self.handle_hot_reload(e).await;
+                Some(e) = update_rx.recv() => {
+                    self.handle_hot_reload(e).await;
+                },
+                Some(result) = handshakes.join_next() => {
+                    if let Err(error) = result {
+                        error!("Connection handshake task failed: {}", error);
                     }
                 }
             }
         }
 
+        handshakes.shutdown().await;
         info!("Shutdown");
 
         Ok(())
@@ -299,15 +306,16 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     conn.flush().await?;
 
     // Lookup the service
-    let service_config = match services.read().await.get(&service_digest) {
-        Some(v) => v,
+    let service_config = services.read().await.get(&service_digest).cloned();
+    let service_config = match service_config {
+        Some(config) => config,
         None => {
             conn.write_all(&bincode::serialize(&Ack::ServiceNotExist).unwrap())
                 .await?;
+            conn.flush().await?;
             bail!("No such a service {}", hex::encode(service_digest));
         }
-    }
-    .to_owned();
+    };
 
     let service_name = &service_config.name;
 
@@ -323,46 +331,37 @@ async fn do_control_channel_handshake<T: 'static + Transport>(
     if session_key != d {
         conn.write_all(&bincode::serialize(&Ack::AuthFailed).unwrap())
             .await?;
+        conn.flush().await?;
         debug!(
             "Expect {}, but got {}",
             hex::encode(session_key),
             hex::encode(d)
         );
         bail!("Service {} failed the authentication", service_name);
-    } else {
-        // A reload may have replaced the configuration while authentication was in flight.
-        let services = services.read().await;
-        if services.get(&service_digest) != Some(&service_config) {
-            bail!(
-                "Configuration changed during authentication for service {}",
-                service_name
-            );
-        }
-        let mut h = control_channels.write().await;
-
-        // If there's already a control channel for the service, then drop the old one.
-        // Because a control channel doesn't report back when it's dead,
-        // the handle in the map could be stall, dropping the old handle enables
-        // the client to reconnect.
-        if h.remove1(&service_digest).is_some() {
-            warn!(
-                "Dropping previous control channel for service {}",
-                service_name
-            );
-        }
-
-        // Send ack
-        conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
-            .await?;
-        conn.flush().await?;
-
-        info!(service = %service_config.name, "Control channel established");
-        let handle =
-            ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
-
-        // Insert the new handle
-        let _ = h.insert(service_digest, session_key, handle);
     }
+
+    conn.write_all(&bincode::serialize(&Ack::Ok).unwrap())
+        .await?;
+    conn.flush().await?;
+
+    // A reload may have changed the configuration while authentication was in flight.
+    let services = services.read().await;
+    if services.get(&service_digest) != Some(&service_config) {
+        bail!(
+            "Configuration changed during authentication for service {}",
+            service_name
+        );
+    }
+    let mut channels = control_channels.write().await;
+    if channels.remove1(&service_digest).is_some() {
+        warn!(
+            "Dropping previous control channel for service {}",
+            service_name
+        );
+    }
+    info!(service = %service_config.name, "Control channel established");
+    let handle = ControlChannelHandle::new(conn, service_config, server_config.heartbeat_interval);
+    let _ = channels.insert(service_digest, session_key, handle);
 
     Ok(())
 }
@@ -384,10 +383,13 @@ async fn do_data_channel_handshake<T: 'static + Transport>(
         T::hint(&conn, SocketOpts::from_server_cfg(&handle.service));
         handle.data_ch_tx.clone()
     };
-    data_ch_tx
-        .send(conn)
-        .await
-        .with_context(|| "Data channel for a stale control channel")?;
+    match data_ch_tx.try_send(conn) {
+        Ok(()) => {}
+        Err(mpsc::error::TrySendError::Full(_)) => debug!("Data channel pool is full"),
+        Err(mpsc::error::TrySendError::Closed(_)) => {
+            bail!("Data channel for a stale control channel")
+        }
+    }
     Ok(())
 }
 
@@ -413,23 +415,17 @@ where
         // Create a shutdown channel
         let (shutdown_tx, mut shutdown_rx) = broadcast::channel::<bool>(1);
 
-        // Store data channels
-        let (data_ch_tx, data_ch_rx) = mpsc::channel(CHAN_SIZE * 2);
-
-        // Store data channel creation requests
-        let (data_ch_req_tx, data_ch_req_rx) = mpsc::unbounded_channel();
-
         // Cache some data channels for later use
         let pool_size = match service.service_type {
             ServiceType::Tcp => TCP_POOL_SIZE,
             ServiceType::Udp => UDP_POOL_SIZE,
             ServiceType::TcpAndUdp => TCP_POOL_SIZE + UDP_POOL_SIZE,
         };
+        let (data_ch_tx, data_ch_rx) = mpsc::channel(pool_size);
+        let (data_ch_req_tx, data_ch_req_rx) = mpsc::channel(pool_size);
 
-        for _i in 0..pool_size {
-            if let Err(e) = data_ch_req_tx.send(true) {
-                error!("Failed to request data channel {}", e);
-            };
+        for _ in 0..pool_size {
+            let _ = data_ch_req_tx.try_send(());
         }
 
         let bind_addr = service.bind_addr.clone();
@@ -467,25 +463,13 @@ where
     }
 }
 
-// Control channel, using T as the transport layer. P is TcpStream or UdpTraffic
 struct ControlChannel<T: Transport> {
-    conn: T::Stream,                               // The connection of control channel
-    data_ch_req_rx: mpsc::UnboundedReceiver<bool>, // Receives visitor connections
-    heartbeat_interval: u64,                       // Application-layer heartbeat interval in secs
+    conn: T::Stream, // The connection of control channel
+    data_ch_req_rx: mpsc::Receiver<()>,
+    heartbeat_interval: u64, // Application-layer heartbeat interval in secs
 }
 
 impl<T: Transport> ControlChannel<T> {
-    async fn write_and_flush(&mut self, data: &[u8]) -> Result<()> {
-        self.conn
-            .write_all(data)
-            .await
-            .with_context(|| "Failed to write control cmds")?;
-        self.conn
-            .flush()
-            .await
-            .with_context(|| "Failed to flush control cmds")?;
-        Ok(())
-    }
     // Run a control channel
     #[instrument(skip_all)]
     async fn run(mut self) -> Result<()> {
@@ -497,23 +481,15 @@ impl<T: Transport> ControlChannel<T> {
         loop {
             tokio::select! {
                 val = self.data_ch_req_rx.recv() => {
-                    match val {
-                        Some(_) => {
-                            if let Err(e) = self.write_and_flush(&create_ch_cmd).await {
-                                error!("{:#}", e);
-                                break;
-                            }
-                        }
-                        None => {
-                            break;
-                        }
+                    if val.is_none() {
+                        break;
                     }
+                    write_command(&mut self.conn, &create_ch_cmd).await
+                        .context("Failed to send data channel request")?;
                 },
                 _ = time::sleep(Duration::from_secs(self.heartbeat_interval)), if self.heartbeat_interval != 0 => {
-                            if let Err(e) = self.write_and_flush(&heartbeat).await {
-                                error!("{:#}", e);
-                                break;
-                            }
+                    write_command(&mut self.conn, &heartbeat).await
+                        .context("Failed to send heartbeat")?;
                 }
                 received = self.conn.read_u8() => {
                     if received.is_ok() {
@@ -530,11 +506,21 @@ impl<T: Transport> ControlChannel<T> {
     }
 }
 
+async fn write_command<S: io::AsyncWrite + Unpin>(conn: &mut S, data: &[u8]) -> Result<()> {
+    time::timeout(NETWORK_IO_TIMEOUT, async {
+        conn.write_all(data).await?;
+        conn.flush().await
+    })
+    .await
+    .context("Command write timed out")??;
+    Ok(())
+}
+
 async fn run_connection_pools<T: Transport>(
     service_type: ServiceType,
     bind_addr: String,
     data_ch_rx: mpsc::Receiver<T::Stream>,
-    data_ch_req_tx: mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: mpsc::Sender<()>,
     mut shutdown_rx: broadcast::Receiver<bool>,
 ) -> Result<()> {
     let data_ch_rx = Mutex::new(data_ch_rx);
@@ -564,7 +550,7 @@ async fn run_connection_pools<T: Transport>(
                 &mut shutdown_rx,
             )
             .await?;
-            run_udp_connection_pool::<T>(socket, &data_ch_rx, None).await
+            run_udp_connection_pool::<T>(socket, &data_ch_rx, &data_ch_req_tx).await
         }
         ServiceType::TcpAndUdp => {
             let (listener, socket) = retry_notify_with_deadline(
@@ -576,7 +562,7 @@ async fn run_connection_pools<T: Transport>(
             .await?;
             tokio::try_join!(
                 run_tcp_connection_pool::<T>(listener, &data_ch_rx, &data_ch_req_tx),
-                run_udp_connection_pool::<T>(socket, &data_ch_rx, Some(&data_ch_req_tx)),
+                run_udp_connection_pool::<T>(socket, &data_ch_rx, &data_ch_req_tx),
             )?;
             Ok(())
         }
@@ -591,19 +577,16 @@ async fn bind_tcp_and_udp(addr: &str) -> io::Result<(TcpListener, UdpSocket)> {
 
 async fn accept_tcp_visitors(
     listener: TcpListener,
-    visitor_tx: mpsc::Sender<TcpStream>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    visitor_tx: mpsc::Sender<(TcpStream, Instant)>,
 ) -> Result<()> {
     let mut backoff = listen_backoff();
     loop {
         match listener.accept().await {
             Ok((incoming, addr)) => {
-                data_ch_req_tx
-                    .send(true)
-                    .context("Failed to request a TCP data channel")?;
+                let deadline = Instant::now() + TCP_VISITOR_TIMEOUT;
                 backoff.reset();
                 debug!("New visitor from {}", addr);
-                visitor_tx.send(incoming).await?;
+                visitor_tx.send((incoming, deadline)).await?;
             }
             Err(error) => {
                 let Some(delay) = backoff.next_backoff() else {
@@ -619,39 +602,77 @@ async fn accept_tcp_visitors(
     }
 }
 
-async fn take_data_channel<S>(data_ch_rx: &Mutex<mpsc::Receiver<S>>) -> Result<S> {
-    data_ch_rx
-        .lock()
-        .await
-        .recv()
-        .await
-        .context("No available data channels")
+fn request_data_channel(requests: &mpsc::Sender<()>) -> Result<()> {
+    match requests.try_send(()) {
+        Ok(()) | Err(mpsc::error::TrySendError::Full(())) => Ok(()),
+        Err(mpsc::error::TrySendError::Closed(())) => bail!("Data channel request queue closed"),
+    }
+}
+
+async fn take_data_channel<S>(
+    data_ch_rx: &Mutex<mpsc::Receiver<S>>,
+    requests: &mpsc::Sender<()>,
+) -> Result<S> {
+    loop {
+        let received = {
+            let mut channels = data_ch_rx.lock().await;
+            time::timeout(DATA_REQUEST_RETRY, channels.recv()).await
+        };
+        match received {
+            Ok(channel) => return channel.context("Data channel pool closed"),
+            Err(_) => {
+                warn!("No data channel arrived. Requesting another");
+                request_data_channel(requests)?;
+            }
+        }
+    }
+}
+
+async fn start_tcp_forward<S: io::AsyncWrite + Unpin>(
+    data_ch_rx: &Mutex<mpsc::Receiver<S>>,
+    requests: &mpsc::Sender<()>,
+    cmd: &[u8],
+) -> Result<S> {
+    loop {
+        let mut channel = take_data_channel(data_ch_rx, requests).await?;
+        match write_command(&mut channel, cmd).await {
+            Ok(()) => return Ok(channel),
+            Err(error) => warn!("Failed to start TCP forwarding: {:#}", error),
+        }
+        request_data_channel(requests)?;
+    }
 }
 
 #[instrument(skip_all)]
 async fn run_tcp_connection_pool<T: Transport>(
     listener: TcpListener,
     data_ch_rx: &Mutex<mpsc::Receiver<T::Stream>>,
-    data_ch_req_tx: &mpsc::UnboundedSender<bool>,
+    data_ch_req_tx: &mpsc::Sender<()>,
 ) -> Result<()> {
     info!("Listening for TCP at {}", listener.local_addr()?);
-    let (visitor_tx, mut visitor_rx) = mpsc::channel::<TcpStream>(CHAN_SIZE);
+    let (visitor_tx, mut visitor_rx) = mpsc::channel(VISITOR_QUEUE_SIZE);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardTcp).unwrap();
 
     tokio::select! {
-        result = accept_tcp_visitors(listener, visitor_tx, data_ch_req_tx) => result,
+        result = accept_tcp_visitors(listener, visitor_tx) => result,
         result = async {
-            while let Some(mut visitor) = visitor_rx.recv().await {
-                loop {
-                    let mut ch = take_data_channel(data_ch_rx).await?;
-                    if ch.write_all(&cmd).await.is_ok() && ch.flush().await.is_ok() {
-                        tokio::spawn(async move {
-                            let _ = copy_bidirectional(&mut ch, &mut visitor).await;
-                        });
-                        break;
-                    }
-                    data_ch_req_tx.send(true).context("Failed to replace a TCP data channel")?;
+            while let Some((mut visitor, deadline)) = visitor_rx.recv().await {
+                if Instant::now() >= deadline {
+                    continue;
                 }
+                // Request a channel for this visitor or replenish the cached one it takes.
+                request_data_channel(data_ch_req_tx)?;
+                let start = start_tcp_forward(data_ch_rx, data_ch_req_tx, &cmd);
+                let mut channel = match time::timeout_at(deadline, start).await {
+                    Ok(result) => result?,
+                    Err(_) => {
+                        debug!("TCP visitor timed out waiting for a data channel");
+                        continue;
+                    }
+                };
+                tokio::spawn(async move {
+                    let _ = copy_bidirectional(&mut channel, &mut visitor).await;
+                });
             }
             Ok(())
         } => result,
@@ -662,24 +683,22 @@ async fn run_tcp_connection_pool<T: Transport>(
 async fn run_udp_connection_pool<T: Transport>(
     socket: UdpSocket,
     data_ch_rx: &Mutex<mpsc::Receiver<T::Stream>>,
-    replacement_requests: Option<&mpsc::UnboundedSender<bool>>,
+    requests: &mpsc::Sender<()>,
 ) -> Result<()> {
     info!("Listening for UDP at {}", socket.local_addr()?);
     let cmd = bincode::serialize(&DataChannelCmd::StartForwardUdp).unwrap();
     let mut backoff = listen_backoff();
     loop {
-        let conn = take_data_channel(data_ch_rx).await?;
+        let conn = take_data_channel(data_ch_rx, requests).await?;
         let Err(error) = forward_udp(&socket, conn, &cmd).await else {
             return Ok(());
         };
-        let (Some(requests), Some(delay)) = (replacement_requests, backoff.next_backoff()) else {
+        let Some(delay) = backoff.next_backoff() else {
             return Err(error);
         };
         warn!("UDP data channel ended: {:#}. Retry in {:?}", error, delay);
         time::sleep(delay).await;
-        requests
-            .send(true)
-            .context("Failed to replace a UDP data channel")?;
+        request_data_channel(requests)?;
     }
 }
 
@@ -687,24 +706,33 @@ async fn forward_udp<S>(socket: &UdpSocket, mut conn: S, cmd: &[u8]) -> Result<(
 where
     S: io::AsyncRead + io::AsyncWrite + Unpin,
 {
-    conn.write_all(cmd).await?;
-    conn.flush().await?;
+    write_command(&mut conn, cmd)
+        .await
+        .context("Failed to start UDP forwarding")?;
 
-    let mut buf = [0u8; UDP_BUFFER_SIZE];
-    loop {
-        tokio::select! {
-            // Forward inbound traffic to the client
-            val = socket.recv_from(&mut buf) => {
-                let (n, from) = val?;
-                UdpTraffic::write_slice(&mut conn, from, &buf[..n]).await?;
-            },
-
-            // Forward outbound traffic from the client to the visitor
-            hdr_len = conn.read_u8() => {
-                let t = UdpTraffic::read(&mut conn, hdr_len?).await?;
-                socket.send_to(&t.data, t.from).await?;
-            }
+    let (mut rd, mut wr) = io::split(conn);
+    let inbound = async {
+        let mut buf = [0u8; UDP_BUFFER_SIZE];
+        loop {
+            let (n, from) = socket.recv_from(&mut buf).await?;
+            UdpTraffic::write_slice(&mut wr, from, &buf[..n]).await?;
         }
+    };
+    let outbound = async {
+        loop {
+            let hdr_len = rd.read_u8().await?;
+            let packet = UdpTraffic::read(&mut rd, hdr_len).await?;
+            time::timeout(
+                NETWORK_IO_TIMEOUT,
+                socket.send_to(&packet.data, packet.from),
+            )
+            .await
+            .context("UDP send to visitor timed out")??;
+        }
+    };
+    tokio::select! {
+        result = inbound => result,
+        result = outbound => result,
     }
 }
 

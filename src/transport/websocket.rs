@@ -6,7 +6,7 @@ use std::task::{ready, Context, Poll};
 
 use super::{AddrMaybeCached, SocketOpts, TcpTransport, TlsTransport, Transport};
 use crate::config::TransportConfig;
-use anyhow::anyhow;
+use anyhow::{anyhow, Context as _};
 use async_trait::async_trait;
 use bytes::Bytes;
 use futures_core::stream::Stream;
@@ -234,14 +234,14 @@ impl Transport for WebsocketTransport {
 
     async fn connect(&self, addr: &AddrMaybeCached) -> anyhow::Result<Self::Stream> {
         let u = format!("ws://{}", &addr.addr.as_str());
-        let url = Url::parse(&u).unwrap();
+        let url = Url::parse(&u).context("Invalid WebSocket URL")?;
         let tstream = match &self.sub {
             SubTransport::Insecure(t) => TransportStream::Insecure(t.connect(addr).await?),
             SubTransport::Secure(t) => TransportStream::Secure(t.connect(addr).await?),
         };
         let (wsstream, _) = client_async_with_config(url, tstream, Some(self.conf))
             .await
-            .expect("failed to connect");
+            .context("Failed to do WebSocket handshake")?;
         let tun = WebsocketTunnel {
             inner: StreamReader::new(StreamWrapper { inner: wsstream }),
         };

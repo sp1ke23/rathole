@@ -6,7 +6,10 @@ use lazy_static::lazy_static;
 use serde::{Deserialize, Serialize};
 use std::net::SocketAddr;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
+use tokio::time;
 use tracing::trace;
+
+use crate::constants::NETWORK_IO_TIMEOUT;
 
 type ProtocolVersion = u8;
 const _PROTO_V0: u8 = 0u8;
@@ -73,20 +76,7 @@ pub struct UdpTraffic {
 
 impl UdpTraffic {
     pub async fn write<T: AsyncWrite + Unpin>(&self, writer: &mut T) -> Result<()> {
-        let hdr = UdpHeader {
-            from: self.from,
-            len: self.data.len() as UdpPacketLen,
-        };
-
-        let v = bincode::serialize(&hdr).unwrap();
-
-        trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
-
-        writer.write_all(&self.data).await?;
-
-        Ok(())
+        Self::write_slice(writer, self.from, &self.data).await
     }
 
     #[allow(dead_code)]
@@ -103,15 +93,25 @@ impl UdpTraffic {
         let v = bincode::serialize(&hdr).unwrap();
 
         trace!("Write {:?} of length {}", hdr, v.len());
-        writer.write_u8(v.len() as u8).await?;
-        writer.write_all(&v).await?;
-
-        writer.write_all(data).await?;
+        time::timeout(NETWORK_IO_TIMEOUT, async {
+            writer.write_u8(v.len() as u8).await?;
+            writer.write_all(&v).await?;
+            writer.write_all(data).await?;
+            writer.flush().await
+        })
+        .await
+        .context("UDP tunnel frame write timed out")??;
 
         Ok(())
     }
 
     pub async fn read<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpTraffic> {
+        time::timeout(NETWORK_IO_TIMEOUT, Self::read_frame(reader, hdr_len))
+            .await
+            .context("UDP tunnel frame read timed out")?
+    }
+
+    async fn read_frame<T: AsyncRead + Unpin>(reader: &mut T, hdr_len: u8) -> Result<UdpTraffic> {
         let mut buf = Vec::new();
         buf.resize(hdr_len as usize, 0);
         reader
@@ -237,8 +237,53 @@ pub async fn read_data_cmd<T: AsyncRead + AsyncWrite + Unpin>(
     conn: &mut T,
 ) -> Result<DataChannelCmd> {
     let mut bytes = vec![0u8; PACKET_LEN.d_cmd];
-    conn.read_exact(&mut bytes)
+    // A prewarmed channel can stay idle until the server assigns it.
+    bytes[0] = conn
+        .read_u8()
         .await
-        .with_context(|| "Failed to read cmd")?;
+        .context("Failed to read data command")?;
+    time::timeout(NETWORK_IO_TIMEOUT, conn.read_exact(&mut bytes[1..]))
+        .await
+        .context("Data command read timed out")?
+        .context("Failed to read data command")?;
     bincode::deserialize(&bytes).with_context(|| "Failed to deserialize data cmd")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use tokio::io::duplex;
+    use tokio::time::Instant;
+
+    #[tokio::test(start_paused = true)]
+    async fn prewarmed_channel_only_times_out_after_command_starts() -> Result<()> {
+        let (mut reader, mut writer) = duplex(8);
+        let start = Instant::now();
+        let (command, sent) = tokio::join!(read_data_cmd(&mut reader), async {
+            time::sleep(NETWORK_IO_TIMEOUT * 2).await;
+            writer.write_u8(0).await
+        });
+        sent?;
+        assert_eq!(
+            command.unwrap_err().to_string(),
+            "Data command read timed out"
+        );
+        assert!(start.elapsed() >= NETWORK_IO_TIMEOUT * 3);
+        Ok(())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn udp_frame_times_out_when_truncated_or_blocked() -> Result<()> {
+        let (mut reader, mut writer) = duplex(1);
+        let addr = SocketAddr::from(([127, 0, 0, 1], 1234));
+        let error = UdpTraffic::write_slice(&mut writer, addr, b"payload")
+            .await
+            .unwrap_err();
+        assert_eq!(error.to_string(), "UDP tunnel frame write timed out");
+
+        let len = reader.read_u8().await?;
+        let error = UdpTraffic::read(&mut reader, len).await.unwrap_err();
+        assert_eq!(error.to_string(), "UDP tunnel frame read timed out");
+        Ok(())
+    }
 }

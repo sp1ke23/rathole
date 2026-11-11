@@ -6,6 +6,13 @@ use std::time::Duration;
 pub const UDP_BUFFER_SIZE: usize = 2048;
 pub const UDP_SENDQ_SIZE: usize = 1024;
 pub const UDP_TIMEOUT: u64 = 60;
+pub const NETWORK_IO_TIMEOUT: Duration = Duration::from_secs(5);
+#[cfg(feature = "client")]
+pub const CONTROL_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "client")]
+pub const DATA_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+#[cfg(feature = "server")]
+pub const DATA_REQUEST_RETRY: Duration = Duration::from_secs(10);
 
 pub fn listen_backoff() -> ExponentialBackoff {
     ExponentialBackoff {
